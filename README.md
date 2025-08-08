@@ -1,16 +1,8 @@
 # codex-as-mcp
 
-[中文版](./README.cn.md)
+[中文版](./README.zh-CN.md)
 
 Enable Claude Code, Cursor and other AI tools to call Codex for task execution. Plus/Pro/Team subscribers can maximize GPT-5 usage without additional costs.
-
-## Execution Modes
-
-🔒 **Safe Mode (Default)**: Read-only operations, no file modifications
-⚡ **Writable Mode**: Full codex capabilities with file/git operations
-
-### Why Sequential Execution?
-Codex is an agent that modifies files and system state. Running multiple instances in parallel could cause file conflicts, git race conditions, and conflicting system modifications. Sequential execution prevents these issues.
 
 ## Setup
 
@@ -30,8 +22,7 @@ Add to your `.mcp.json`:
     "codex": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["codex-as-mcp@latest"],
-      "env": {}
+      "args": ["codex-as-mcp@latest"]
     }
   }
 }
@@ -44,8 +35,7 @@ Add to your `.mcp.json`:
     "codex": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["codex-as-mcp@latest", "--yolo"],
-      "env": {}
+      "args": ["codex-as-mcp@latest", "--yolo"]
     }
   }
 }
@@ -56,18 +46,17 @@ Or use Claude Code commands:
 # Safe mode (default)
 claude mcp add codex-as-mcp -- uvx codex-as-mcp@latest
 
-# Writable mode  
+# Writable mode
 claude mcp add codex-as-mcp -- uvx codex-as-mcp@latest --yolo
-
-# Show detailed mode explanation
-uvx codex-as-mcp@latest --help-modes
 ```
 
-### 3. Usage
+## Tools
 
 The MCP server exposes two tools:
 - `codex_execute(prompt, work_dir)` - General purpose codex execution
 - `codex_review(review_type, work_dir, target?, prompt?)` - Specialized code review
+
+If you have any other use case requirements, feel free to open issue.
 
 ## Safety
 

@@ -3,10 +3,7 @@
     "codex": {
       "type": "stdio",
       "command": "uvx",
-      "args": [
-        "codex-as-mcp@latest"
-      ],
-      "env": {}
+      "args": ["codex-as-mcp@latest", "--yolo"]
     }
   }
 }
