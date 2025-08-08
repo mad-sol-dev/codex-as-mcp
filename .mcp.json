@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "codex": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "codex-as-mcp@latest"
+      ],
+      "env": {}
+    }
+  }
+}

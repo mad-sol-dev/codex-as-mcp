@@ -1,7 +1,12 @@
 from mcp.server.fastmcp import FastMCP, Context
 import subprocess
 import re
+import argparse
+import sys
 from typing import List, Dict, Optional, Sequence
+
+# Global safe mode setting
+SAFE_MODE = True
 
 mcp = FastMCP("codex-as-mcp")
 
@@ -25,7 +30,8 @@ BLOCK_RE = re.compile(
 def run_and_extract_codex_blocks(
     cmd: Sequence[str],
     tags: Optional[Sequence[str]] = ("codex",),
-    last_n: int = 1
+    last_n: int = 1,
+    safe_mode: bool = True
 ) -> List[Dict[str, str]]:
     """
     运行命令并抽取日志块。每个块由形如
@@ -38,8 +44,16 @@ def run_and_extract_codex_blocks(
     :param last_n: 返回最后 N 个匹配块
     :return: [{timestamp, tag, body, raw}] 按时间顺序（旧->新）
     """
+    # Modify command based on safe mode
+    final_cmd = list(cmd)
+    if safe_mode:
+        # Replace --full-auto with read-only sandbox
+        if "--full-auto" in final_cmd:
+            idx = final_cmd.index("--full-auto")
+            final_cmd[idx:idx+1] = ["--sandbox", "read-only"]
+    
     proc = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        final_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
     out = proc.stdout
 
@@ -163,7 +177,7 @@ async def codex_execute(prompt: str, work_dir: str, ctx: Context) -> str:
         "--cd", work_dir,
         prompt,
     ]
-    return run_and_extract_codex_blocks(cmd)[-1]["raw"]
+    return run_and_extract_codex_blocks(cmd, safe_mode=SAFE_MODE)[-1]["raw"]
 
 
 @mcp.tool()
@@ -256,11 +270,61 @@ async def codex_review(review_type: str, work_dir: str, target: str = "", prompt
         "--cd", work_dir,
         final_prompt,
     ]
-    return run_and_extract_codex_blocks(cmd)[-1]["raw"]
+    return run_and_extract_codex_blocks(cmd, safe_mode=SAFE_MODE)[-1]["raw"]
 
 
 def main():
     """Entry point for the MCP server"""
+    global SAFE_MODE
+    
+    parser = argparse.ArgumentParser(
+        prog="codex-as-mcp",
+        description="MCP server that provides codex agent tools"
+    )
+    parser.add_argument(
+        "--yolo", 
+        action="store_true",
+        help="Enable writable mode (allows file modifications, git operations, etc.)"
+    )
+    parser.add_argument(
+        "--help-modes",
+        action="store_true", 
+        help="Show detailed explanation of safe vs writable modes"
+    )
+    
+    args = parser.parse_args()
+    
+    if args.help_modes:
+        print("""
+Codex-as-MCP Execution Modes:
+
+🔒 Safe Mode (default):
+  - Read-only operations only
+  - No file modifications
+  - No git operations  
+  - Safe for exploration and analysis
+  
+⚡ Writable Mode (--yolo):
+  - Full codex agent capabilities
+  - Can modify files, run git commands
+  - Sequential execution prevents conflicts
+  - Use with caution in production
+  
+Why Sequential Execution?
+Codex is an agent that modifies files and system state. Running multiple
+instances in parallel could cause file conflicts, git race conditions,
+and conflicting system modifications. Sequential execution is safer.
+""")
+        sys.exit(0)
+    
+    # Set safe mode based on --yolo flag
+    SAFE_MODE = not args.yolo
+    
+    if SAFE_MODE:
+        print("🔒 Running in SAFE mode (read-only). Use --yolo for writable mode.")
+    else:
+        print("⚡ Running in WRITABLE mode. Codex can modify files and system state.")
+    
     mcp.run()
 
 
