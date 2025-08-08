@@ -75,14 +75,7 @@ async def codex_execute(prompt: str, work_dir: str, ctx: Context) -> str:
 
 def main():
     """Entry point for the MCP server"""
-    import asyncio
-    from mcp.server.stdio import stdio_server
-    
-    async def run():
-        async with stdio_server() as (read_stream, write_stream):
-            await mcp.run(read_stream, write_stream, mcp.create_initialization_options())
-    
-    asyncio.run(run())
+    mcp.run()
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 [project]
 name = "codex-as-mcp"
-version = "0.1.0"
+version = "0.1.2"
 description = "MCP server that provides access to codex CLI for code generation and review"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "kky", email = "kky42@example.com"}
 ]
 keywords = ["mcp", "codex", "code-generation", "ai"]
 classifiers = [
@@ -27,3 +27,15 @@ codex-as-mcp = "codex_as_mcp.server:main"
 Homepage = "https://github.com/kky42/codex-as-mcp"
 Repository = "https://github.com/kky42/codex-as-mcp"
 Issues = "https://github.com/kky42/codex-as-mcp/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_as_mcp"]
+
+[dependency-groups]
+dev = [
+    "twine>=6.1.0",
+]
