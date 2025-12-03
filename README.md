@@ -1,4 +1,23 @@
 # codex-as-mcp
+The Actual Config Locations
+Based on the documentation and community findings:
+
+User scope (--scope user): Stored in ~/.claude.json
+Project scope (--scope project): Stored in .mcp.json in the project root
+Local scope (--scope local): Project-specific, private to you
+
+The user scope is stored in ~/.claude.json and is recommended for tools you'll use regularly. Cloud Artisan
+Your Actual Issue
+Looking back at your error message, you had the server configured at:
+
+/root/.claude.json (local config for project /mnt/e/A/az)
+/mnt/e/A/az/.mcp.json (project config)
+
+But you were in a different directory (/mnt/e/A/Carrace), so the project-level config wasn't being picked up.
+The Fix
+Try adding it with user scope so it works everywhere:
+bashclaude mcp add codex-subagent --scope user -- uvx codex-as-mcp@latest
+Then restart Claude Code and run /mcp to verify.
 
 [中文版](./README.zh-CN.md)
 
