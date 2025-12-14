@@ -51,7 +51,9 @@ def _resolve_codex_executable() -> str:
 
 
 @mcp.tool()
-async def spawn_agent(ctx: Context, prompt: str) -> str:
+async def spawn_agent(
+    ctx: Context, prompt: str, timeout_seconds: float | int | None = DEFAULT_TIMEOUT_SECONDS
+) -> str:
     """Spawn a Codex agent to work inside the current working directory.
 
     The server resolves the working directory via ``os.getcwd()`` so it inherits
@@ -59,15 +61,27 @@ async def spawn_agent(ctx: Context, prompt: str) -> str:
 
     Args:
         prompt: All instructions/context the agent needs for the task.
+        timeout_seconds: Max seconds to allow the Codex CLI to run. Defaults to
+            ``DEFAULT_TIMEOUT_SECONDS``.
 
     Returns:
-        The agent's final response (clean output from Codex CLI).
+        The agent's final response (clean output from Codex CLI) or a clear
+        timeout/error message.
     """
     # Basic validation to avoid confusing UI errors
     if not isinstance(prompt, str):
         return "Error: 'prompt' must be a string."
     if not prompt.strip():
         return "Error: 'prompt' is required and cannot be empty."
+
+    if timeout_seconds is None:
+        timeout_seconds = DEFAULT_TIMEOUT_SECONDS
+    try:
+        timeout_seconds = float(timeout_seconds)
+        if timeout_seconds <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        return "Error: 'timeout_seconds' must be a positive number."
 
     try:
         codex_exec = _resolve_codex_executable()
@@ -113,31 +127,63 @@ async def spawn_agent(ctx: Context, prompt: str) -> str:
         stdout_task = asyncio.create_task(proc.stdout.read()) if proc.stdout else None
         stderr_task = asyncio.create_task(proc.stderr.read()) if proc.stderr else None
 
-        # Send periodic heartbeats while process runs
-        last_ping = time.monotonic()
-        while True:
+        async def _wait_with_heartbeats() -> int:
+            last_ping = time.monotonic()
+            while True:
+                try:
+                    return await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    now = time.monotonic()
+                    if now - last_ping >= 2.0:
+                        last_ping = now
+                        try:
+                            await ctx.report_progress(1, None, "Codex agent running...")
+                        except Exception:
+                            pass
+
+        try:
+            returncode = await asyncio.wait_for(
+                _wait_with_heartbeats(), timeout=timeout_seconds
+            )
+        except asyncio.TimeoutError:
             try:
-                returncode = await asyncio.wait_for(proc.wait(), timeout=2.0)
-                break
+                proc.terminate()
+            except Exception:
+                pass
+
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=1.0)
             except asyncio.TimeoutError:
-                now = time.monotonic()
-                if now - last_ping >= 2.0:
-                    last_ping = now
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+
+            for task in (stdout_task, stderr_task):
+                if task:
+                    task.cancel()
                     try:
-                        await ctx.report_progress(1, None, "Codex agent running...")
+                        await task
                     except Exception:
                         pass
 
-        stdout = ""
-        if stdout_task:
-            stdout_bytes = await stdout_task
-            stdout = stdout_bytes.decode(errors="replace")
+            return f"Error: Codex agent timed out after {timeout_seconds} seconds."
 
-        stderr = ""
-        if stderr_task:
-            stderr_bytes = await stderr_task
-            stderr = stderr_bytes.decode(errors="replace")
+        async def _decode_stream(task: asyncio.Task | None) -> str:
+            if not task:
+                return ""
+            try:
+                data = await task
+                return data.decode(errors="replace")
+            except Exception:
+                return ""
 
+        stdout = await _decode_stream(stdout_task)
+        stderr = await _decode_stream(stderr_task)
         output = output_path.read_text(encoding="utf-8").strip()
 
         if returncode != 0:
@@ -160,7 +206,8 @@ async def spawn_agent(ctx: Context, prompt: str) -> str:
 @mcp.tool()
 async def spawn_agents_parallel(
     ctx: Context,
-    agents: list[dict[str, str]]
+    agents: list[dict[str, str]],
+    timeout_seconds: float | int | None = DEFAULT_TIMEOUT_SECONDS,
 ) -> list[dict[str, str]]:
     """Spawn multiple Codex agents in parallel.
 
@@ -168,11 +215,14 @@ async def spawn_agents_parallel(
     (``os.getcwd()``).
 
     Args:
-        agents: List of agent specs, each with a 'prompt' entry.
+        agents: List of agent specs, each with a 'prompt' entry and optional
+            'timeout_seconds' override.
                 Example: [
                     {"prompt": "Create math.md"},
-                    {"prompt": "Create story.md"}
+                    {"prompt": "Create story.md", "timeout_seconds": 600}
                 ]
+        timeout_seconds: Default max seconds for each agent unless overridden
+            per spec. Defaults to ``DEFAULT_TIMEOUT_SECONDS``.
 
     Returns:
         List of results with 'index', 'output', and optional 'error' fields.
@@ -205,8 +255,10 @@ async def spawn_agents_parallel(
             except Exception:
                 pass
 
+            agent_timeout = spec.get("timeout_seconds", timeout_seconds)
+
             # Run the agent
-            output = await spawn_agent(ctx, prompt)
+            output = await spawn_agent(ctx, prompt, agent_timeout)
 
             # Check if output contains an error
             if output.startswith("Error:"):
