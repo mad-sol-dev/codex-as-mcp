@@ -81,3 +81,5 @@ args = ["codex-as-mcp@latest"]
 
 - `spawn_agent(prompt: str)` – Spawns an autonomous Codex subagent using the server's working directory and returns the agent's final message.
 - `spawn_agents_parallel(agents: list[dict])` – Spawns multiple Codex subagents in parallel; each item must include a `prompt` key and results include either an `output` or an `error` per agent.
+
+Codex stdout/stderr logs are persisted under `~/.cache/codex-as-mcp/logs` by default. Override the location by setting `CODEX_AS_MCP_LOG_DIR`, and use the `Log file:` line in tool responses to inspect the saved output.

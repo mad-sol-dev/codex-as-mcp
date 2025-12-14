@@ -18,8 +18,8 @@ import asyncio
 import contextlib
 import os
 import shutil
-import tempfile
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Deque
@@ -30,6 +30,11 @@ from mcp.server.fastmcp import FastMCP, Context
 # Default timeout (seconds) for the spawned agent run.
 # Chosen to be long to accommodate non-trivial editing tasks.
 DEFAULT_TIMEOUT_SECONDS: int = 8 * 60 * 60  # 8 hours
+
+# Log management defaults
+LOG_ROOT_ENV_VAR = "CODEX_AS_MCP_LOG_DIR"
+DEFAULT_LOG_ROOT = Path.home() / ".cache" / "codex-as-mcp" / "logs"
+LOG_ROTATE_BYTES = 512_000
 
 
 mcp = FastMCP("codex-subagent")
@@ -51,6 +56,30 @@ def _resolve_codex_executable() -> str:
             "and ensure your shell PATH includes the npm global bin."
         )
     return codex
+
+
+def _prepare_log_root() -> Path:
+    """Return the directory for storing Codex logs, creating it if needed."""
+
+    override = os.environ.get(LOG_ROOT_ENV_VAR)
+    root = Path(override).expanduser() if override else DEFAULT_LOG_ROOT
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _allocate_log_paths(agent_index: int | None) -> tuple[Path, Path]:
+    """Allocate deterministic paths for log and last message files."""
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    suffix_parts = [str(os.getpid())]
+    if agent_index is not None:
+        suffix_parts.append(str(agent_index))
+    suffix_parts.append(uuid.uuid4().hex[:8])
+    base_name = f"codex_agent_{timestamp}_{'_'.join(suffix_parts)}"
+    log_root = _prepare_log_root()
+    log_file = log_root / f"{base_name}.log"
+    output_path = log_root / f"{base_name}.last_message.md"
+    return log_file, output_path
 
 
 @mcp.tool()
@@ -97,34 +126,37 @@ async def spawn_agent(
 
     work_directory = os.getcwd()
 
-    with tempfile.TemporaryDirectory(prefix="codex_output_") as temp_dir:
-        output_path = Path(temp_dir) / "last_message.md"
+    try:
+        log_file, output_path = _allocate_log_paths(agent_index)
         output_path.touch()
+        log_file.touch()
+    except Exception as e:
+        return f"Error: Unable to prepare log directory: {e}"
 
-        log_file = Path(temp_dir) / "codex_agent.log"
-        max_log_bytes = 512_000  # Rotate to keep logs lightweight on stdio
-        log_lock = asyncio.Lock()
-        log_suffix = ".1"
-        recent_lines: Deque[str] = deque(maxlen=50)
-        log_note = f"Log file: {log_file}"
+    max_log_bytes = LOG_ROTATE_BYTES  # Rotate to keep logs lightweight on stdio
+    log_lock = asyncio.Lock()
+    log_suffix = ".1"
+    recent_lines: Deque[str] = deque(maxlen=50)
+    log_note = f"Log file: {log_file}"
 
-        agent_label = f"agent {agent_index}" if agent_index is not None else "agent"
+    agent_label = f"agent {agent_index}" if agent_index is not None else "agent"
 
-        # Quote the prompt so Codex CLI receives it wrapped in "..."
-        quoted_prompt = '"' + prompt.replace('"', '\\"') + '"'
+    # Quote the prompt so Codex CLI receives it wrapped in "..."
+    quoted_prompt = '"' + prompt.replace('"', '\\"') + '"'
 
-        cmd = [
-            codex_exec,
-            "e",
-            "--cd",
-            work_directory,
-            "--skip-git-repo-check",
-            "--full-auto",
-            "--output-last-message",
-            str(output_path),
-            quoted_prompt,
-        ]
+    cmd = [
+        codex_exec,
+        "e",
+        "--cd",
+        work_directory,
+        "--skip-git-repo-check",
+        "--full-auto",
+        "--output-last-message",
+        str(output_path),
+        quoted_prompt,
+    ]
 
+    try:
         # Initial progress ping
         try:
             await ctx.report_progress(
@@ -290,6 +322,10 @@ async def spawn_agent(
             return "\n".join(details)
 
         return "\n".join([output, log_note]) if output else log_note
+    finally:
+        with contextlib.suppress(Exception):
+            if output_path.exists():
+                output_path.unlink()
 
 
 @mcp.tool()
