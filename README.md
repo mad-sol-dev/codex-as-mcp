@@ -83,3 +83,31 @@ args = ["codex-as-mcp@latest"]
 - `spawn_agents_parallel(agents: list[dict])` – Spawns multiple Codex subagents in parallel; each item must include a `prompt` key and results include either an `output` or an `error` per agent.
 
 Codex stdout/stderr logs are persisted under `~/.cache/codex-as-mcp/logs` by default. Override the location by setting `CODEX_AS_MCP_LOG_DIR`, and use the `Log file:` line in tool responses to inspect the saved output.
+
+## Run from a cloned repository
+
+If you want to run the MCP server directly from a local checkout without installing the published package, use:
+
+```bash
+uv run python -m codex_as_mcp
+```
+
+This uses `uv` to resolve and install dependencies declared in `pyproject.toml` into an isolated environment. If you've already installed the dependencies into your active environment, you can invoke the module directly:
+
+```bash
+python -m codex_as_mcp
+```
+
+To point a `.mcp.json` configuration at your cloned source (using `uv` to handle dependencies), add:
+
+```json
+{
+  "mcpServers": {
+    "codex-subagent": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "python", "-m", "codex_as_mcp"]
+    }
+  }
+}
+```
