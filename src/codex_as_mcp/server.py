@@ -15,11 +15,14 @@ Notes:
 """
 
 import asyncio
+import contextlib
 import os
 import shutil
 import tempfile
 import time
+from collections import deque
 from pathlib import Path
+from typing import Deque
 
 from mcp.server.fastmcp import FastMCP, Context
 
@@ -52,7 +55,11 @@ def _resolve_codex_executable() -> str:
 
 @mcp.tool()
 async def spawn_agent(
-    ctx: Context, prompt: str, timeout_seconds: float | int | None = DEFAULT_TIMEOUT_SECONDS
+    ctx: Context,
+    prompt: str,
+    timeout_seconds: float | int | None = DEFAULT_TIMEOUT_SECONDS,
+    agent_index: int | None = None,
+    agent_count: int | None = None,
 ) -> str:
     """Spawn a Codex agent to work inside the current working directory.
 
@@ -65,8 +72,8 @@ async def spawn_agent(
             ``DEFAULT_TIMEOUT_SECONDS``.
 
     Returns:
-        The agent's final response (clean output from Codex CLI) or a clear
-        timeout/error message.
+        The agent's final response (clean output from Codex CLI) with the log
+        file path appended, or a clear timeout/error message.
     """
     # Basic validation to avoid confusing UI errors
     if not isinstance(prompt, str):
@@ -94,6 +101,15 @@ async def spawn_agent(
         output_path = Path(temp_dir) / "last_message.md"
         output_path.touch()
 
+        log_file = Path(temp_dir) / "codex_agent.log"
+        max_log_bytes = 512_000  # Rotate to keep logs lightweight on stdio
+        log_lock = asyncio.Lock()
+        log_suffix = ".1"
+        recent_lines: Deque[str] = deque(maxlen=50)
+        log_note = f"Log file: {log_file}"
+
+        agent_label = f"agent {agent_index}" if agent_index is not None else "agent"
+
         # Quote the prompt so Codex CLI receives it wrapped in "..."
         quoted_prompt = '"' + prompt.replace('"', '\\"') + '"'
 
@@ -111,7 +127,11 @@ async def spawn_agent(
 
         # Initial progress ping
         try:
-            await ctx.report_progress(0, None, "Launching Codex agent...")
+            await ctx.report_progress(
+                agent_index if agent_index is not None else 0,
+                agent_count,
+                f"[{agent_label}] Launching Codex agent...",
+            )
         except Exception:
             pass
 
@@ -124,8 +144,75 @@ async def spawn_agent(
         except Exception as e:
             return f"Error: Failed to launch Codex agent: {e}"
 
-        stdout_task = asyncio.create_task(proc.stdout.read()) if proc.stdout else None
-        stderr_task = asyncio.create_task(proc.stderr.read()) if proc.stderr else None
+        stdout_lines = 0
+        stderr_lines = 0
+        bytes_seen = 0
+        last_non_empty_line = ""
+
+        async def _write_log(prefix: str, text: str) -> None:
+            nonlocal bytes_seen
+            async with log_lock:
+                if log_file.exists() and log_file.stat().st_size > max_log_bytes:
+                    rotated = log_file.with_name(log_file.name + log_suffix)
+                    try:
+                        if rotated.exists():
+                            rotated.unlink()
+                        log_file.rename(rotated)
+                    except Exception:
+                        pass
+                entry = f"[{prefix}] {text}"
+                with log_file.open("a", encoding="utf-8") as handle:
+                    handle.write(entry)
+                bytes_seen += len(entry.encode("utf-8", errors="replace"))
+
+        async def _consume_stream(stream: asyncio.StreamReader | None, prefix: str) -> None:
+            nonlocal stdout_lines, stderr_lines, last_non_empty_line
+            if not stream:
+                return
+            while True:
+                try:
+                    line = await stream.readline()
+                except Exception:
+                    break
+                if not line:
+                    break
+                decoded = line.decode(errors="replace")
+                if prefix == "stdout":
+                    stdout_lines += 1
+                else:
+                    stderr_lines += 1
+                if decoded.strip():
+                    last_non_empty_line = f"{prefix}: {decoded.strip()}"
+                recent_lines.append(f"{prefix}: {decoded.rstrip()}".rstrip())
+                await _write_log(prefix, decoded)
+
+        stop_progress = asyncio.Event()
+
+        async def _progress_reporter() -> None:
+            start = time.monotonic()
+            while not stop_progress.is_set():
+                await asyncio.sleep(2)
+                elapsed = int(time.monotonic() - start)
+                message_parts = [
+                    f"[{agent_label}] {elapsed}s elapsed",
+                    f"stdout lines={stdout_lines}",
+                    f"stderr lines={stderr_lines}",
+                    f"bytes={bytes_seen}",
+                ]
+                if last_non_empty_line:
+                    message_parts.append(f"last: {last_non_empty_line}")
+                try:
+                    await ctx.report_progress(
+                        agent_index if agent_index is not None else 1,
+                        agent_count,
+                        "; ".join(message_parts),
+                    )
+                except Exception:
+                    pass
+
+        stdout_task = asyncio.create_task(_consume_stream(proc.stdout, "stdout"))
+        stderr_task = asyncio.create_task(_consume_stream(proc.stderr, "stderr"))
+        progress_task = asyncio.create_task(_progress_reporter())
 
         async def _wait_with_heartbeats() -> int:
             last_ping = time.monotonic()
@@ -137,7 +224,11 @@ async def spawn_agent(
                     if now - last_ping >= 2.0:
                         last_ping = now
                         try:
-                            await ctx.report_progress(1, None, "Codex agent running...")
+                            await ctx.report_progress(
+                                agent_index if agent_index is not None else 1,
+                                agent_count,
+                                f"[{agent_label}] Codex agent running...",
+                            )
                         except Exception:
                             pass
 
@@ -163,7 +254,7 @@ async def spawn_agent(
                 except asyncio.TimeoutError:
                     pass
 
-            for task in (stdout_task, stderr_task):
+            for task in (stdout_task, stderr_task, progress_task):
                 if task:
                     task.cancel()
                     try:
@@ -171,19 +262,18 @@ async def spawn_agent(
                     except Exception:
                         pass
 
-            return f"Error: Codex agent timed out after {timeout_seconds} seconds."
+            return "\n".join(
+                [
+                    f"Error: Codex agent timed out after {timeout_seconds} seconds.",
+                    log_note,
+                ]
+            )
 
-        async def _decode_stream(task: asyncio.Task | None) -> str:
-            if not task:
-                return ""
-            try:
-                data = await task
-                return data.decode(errors="replace")
-            except Exception:
-                return ""
-
-        stdout = await _decode_stream(stdout_task)
-        stderr = await _decode_stream(stderr_task)
+        stop_progress.set()
+        for task in (stdout_task, stderr_task, progress_task):
+            if task:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         output = output_path.read_text(encoding="utf-8").strip()
 
         if returncode != 0:
@@ -192,15 +282,14 @@ async def spawn_agent(
                 f"Command: {' '.join(cmd)}",
                 f"Exit Code: {returncode}",
             ]
-            if stderr:
-                details.append(f"Stderr: {stderr}")
-            if stdout:
-                details.append(f"Stdout: {stdout}")
+            if recent_lines:
+                details.append("Recent output:\n" + "\n".join(recent_lines))
             if output:
                 details.append(f"Captured Output: {output}")
+            details.append(log_note)
             return "\n".join(details)
 
-        return output
+        return "\n".join([output, log_note]) if output else log_note
 
 
 @mcp.tool()
@@ -225,7 +314,8 @@ async def spawn_agents_parallel(
             per spec. Defaults to ``DEFAULT_TIMEOUT_SECONDS``.
 
     Returns:
-        List of results with 'index', 'output', and optional 'error' fields.
+        List of results with 'index', 'output', and optional 'error' and
+        'log_file' fields.
     """
     if not isinstance(agents, list):
         return [{"index": "0", "error": "Error: 'agents' must be a list of agent specs."}]
@@ -250,7 +340,7 @@ async def spawn_agents_parallel(
                 await ctx.report_progress(
                     index,
                     len(agents),
-                    f"Starting agent {index + 1}/{len(agents)}..."
+                    f"[agent {index}] Starting agent {index + 1}/{len(agents)}...",
                 )
             except Exception:
                 pass
@@ -258,13 +348,30 @@ async def spawn_agents_parallel(
             agent_timeout = spec.get("timeout_seconds", timeout_seconds)
 
             # Run the agent
-            output = await spawn_agent(ctx, prompt, agent_timeout)
+            output = await spawn_agent(
+                ctx,
+                prompt,
+                agent_timeout,
+                agent_index=index,
+                agent_count=len(agents),
+            )
+
+            log_file_line = ""
+            for line in output.splitlines():
+                if line.startswith("Log file: "):
+                    log_file_line = line.replace("Log file: ", "", 1).strip()
+                    break
 
             # Check if output contains an error
             if output.startswith("Error:"):
-                return {"index": str(index), "error": output}
+                result: dict[str, str] = {"index": str(index), "error": output}
+            else:
+                result = {"index": str(index), "output": output}
 
-            return {"index": str(index), "output": output}
+            if log_file_line:
+                result["log_file"] = log_file_line
+
+            return result
 
         except Exception as e:
             return {"index": str(index), "error": f"Agent {index}: {str(e)}"}
