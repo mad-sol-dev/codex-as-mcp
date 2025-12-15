@@ -1,7 +1,7 @@
 # codex-as-mcp
 
 Minimal MCP server that lets you spawn Codex agents from any MCP client. Two tools are exposed:
-- `spawn_agent` runs a single Codex agent in the server's working directory.
+- `spawn_agent` runs a single Codex agent in the server's working directory (override with `CODEX_AGENT_CWD`).
 - `spawn_agents_parallel` launches multiple Codex agents concurrently in the same directory.
 
 [中文版](./README.zh-CN.md)
@@ -60,10 +60,32 @@ args = ["codex-as-mcp@latest"]
 
 ## Tools
 
-- `spawn_agent(prompt: str, reasoning_effort?: str, model?: str)` – Spawns an autonomous Codex agent in the server's working directory and returns the final message. Optional `reasoning_effort` (`low`, `medium`, `high`, `xhigh`) and `model` override the Codex defaults.
+- `spawn_agent(prompt: str, reasoning_effort?: str, model?: str)` – Spawns an autonomous Codex agent in the server's working directory (override with `CODEX_AGENT_CWD`) and returns the final message. Optional `reasoning_effort` (`low`, `medium`, `high`, `xhigh`) and `model` override the Codex defaults.
 - `spawn_agents_parallel(agents: list[dict])` – Runs multiple Codex agents in parallel. Each item must include a `prompt` and may include `reasoning_effort` and `model`. Results contain either an `output` or an `error` per agent plus the log path when available.
 
-Codex stdout/stderr logs are persisted under `~/.cache/codex-as-mcp/logs` by default. Override the location by setting `CODEX_AS_MCP_LOG_DIR`, and use the `Log file:` line in tool responses to inspect the saved output.
+## Configuration
+
+### Environment variables
+
+- `CODEX_AGENT_CWD`: Overrides the working directory passed to spawned agents (`--cd`). By default agents inherit the MCP server's current directory (`os.getcwd()`); set this when the server must run from one location but agents should edit a different workspace (for example, the server runs from a parent folder while agents work inside a repo).
+- `CODEX_AS_MCP_LOG_DIR`: Overrides where stdout/stderr logs are persisted (default `~/.cache/codex-as-mcp/logs`). Use the `Log file:` line in tool responses to inspect saved output.
+
+Example `.mcp.json` showing a custom agent working directory:
+
+```json
+{
+  "mcpServers": {
+    "codex-subagent": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["codex-as-mcp@latest"],
+      "env": {
+        "CODEX_AGENT_CWD": "/Users/you/projects/target-repo"
+      }
+    }
+  }
+}
+```
 
 ## Run from a cloned repository
 

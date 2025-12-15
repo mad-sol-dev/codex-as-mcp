@@ -5,12 +5,14 @@ Tool: spawn_agent(prompt: str) -> str
 - Runs the Codex CLI agent and returns its final response as the tool result.
 
 Command executed:
-    codex e --cd {os.getcwd()} --skip-git-repo-check --full-auto \
+    codex e --cd {CODEX_AGENT_CWD or os.getcwd()} --skip-git-repo-check --full-auto \
         --output-last-message {temp_output} "{prompt}"
 
 Notes:
 - No Authorization headers or extra auth flows are used.
 - Uses a generous default timeout to allow long-running agent sessions.
+- The working directory passed to Codex can be overridden via
+  CODEX_AGENT_CWD when the MCP server itself must run elsewhere.
 - Designed to be run via: `uv run python -m codex_as_mcp`
 """
 
@@ -202,10 +204,12 @@ async def spawn_agent(
     agent_index: Optional[int] = None,
     agent_count: Optional[int] = None,
 ) -> str:
-    """Spawn a Codex agent to work inside the current working directory.
+    """Spawn a Codex agent to work inside the configured working directory.
 
-    The server resolves the working directory via ``os.getcwd()`` so it inherits
-    whatever environment the MCP process currently has.
+    The server resolves the working directory via ``CODEX_AGENT_CWD`` if set,
+    otherwise ``os.getcwd()`` so it inherits whatever environment the MCP
+    process currently has. Use the environment variable when the server runs
+    from one location but you want agents to work in another workspace.
 
     Args:
         prompt: All instructions/context the agent needs for the task.
@@ -259,7 +263,8 @@ async def spawn_agent(
             message=str(e),
         )
 
-    work_directory = os.getcwd()
+    # Allow overriding the working directory for spawned agents
+    working_dir = os.environ.get("CODEX_AGENT_CWD", os.getcwd())
 
     try:
         log_file, output_path = _allocate_log_paths(agent_index)
@@ -285,7 +290,7 @@ async def spawn_agent(
         "agent_id": agent_id,
         "agent_index": agent_index,
         "agent_count": agent_count,
-        "workdir": work_directory,
+        "workdir": working_dir,
         "prompt_preview": prompt_preview,
         "pid": os.getpid(),
     }
@@ -294,7 +299,7 @@ async def spawn_agent(
         codex_exec,
         "e",
         "--cd",
-        work_directory,
+        working_dir,
         "--skip-git-repo-check",
         "--full-auto",
         "--output-last-message",
@@ -661,8 +666,10 @@ async def spawn_agents_parallel(
 ) -> list[dict[str, Any]]:
     """Spawn multiple Codex agents in parallel.
 
-    Each spawned agent reuses the server's current working directory
-    (``os.getcwd()``).
+    Each spawned agent reuses the working directory resolved for the server:
+    ``CODEX_AGENT_CWD`` if set, otherwise the current working directory
+    (``os.getcwd()``). This allows the server to run from one place while
+    agents edit a different workspace.
 
     Args:
         agents: List of agent specs, each with a 'prompt' entry and optional
