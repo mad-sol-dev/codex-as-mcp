@@ -1,45 +1,17 @@
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
 
 from codex_as_mcp import server
-
-
-class DummyContext:
-    def __init__(self) -> None:
-        self.progress: list[tuple[int | None, int | None, str]] = []
-
-    async def report_progress(self, index: int | None, total: int | None, message: str) -> None:
-        self.progress.append((index, total, message))
-
-
-class FakeProcess:
-    def __init__(self, stdout_chunks: list[bytes], stderr_chunks: list[bytes], returncode: int = 0) -> None:
-        self.stdout = asyncio.StreamReader()
-        self.stderr = asyncio.StreamReader()
-        for chunk in stdout_chunks:
-            self.stdout.feed_data(chunk)
-        self.stdout.feed_eof()
-        for chunk in stderr_chunks:
-            self.stderr.feed_data(chunk)
-        self.stderr.feed_eof()
-        self._returncode = returncode
-
-    async def wait(self) -> int:
-        return self._returncode
-
-    def terminate(self) -> None:  # pragma: no cover - used only on timeouts
-        self._returncode = -1
-
-    def kill(self) -> None:  # pragma: no cover - used only on timeouts
-        self._returncode = -9
+from tests.conftest import DummyContext, FakeProcess
 
 
 @pytest.mark.asyncio
 async def test_spawn_agent_writes_persistent_log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv(server.LOG_ROOT_ENV_VAR, str(tmp_path))
-    monkeypatch.setattr(server, "LOG_ROTATE_BYTES", 50)
+    monkeypatch.setattr(server, "LOG_ROTATE_BYTES", 1000)
     monkeypatch.setattr(server, "_resolve_codex_executable", lambda: "codex")
 
     stdout_chunks = [b"x" * 60 + b"\n", b"second line\n"]
@@ -58,9 +30,47 @@ async def test_spawn_agent_writes_persistent_log(monkeypatch: pytest.MonkeyPatch
     assert log_path.exists()
     assert log_path.parent == tmp_path
 
-    rotated = log_path.with_name(log_path.name + ".1")
-    assert rotated.exists()
-    assert "[stdout]" in rotated.read_text(encoding="utf-8")
-    assert "[stderr] warning" in log_path.read_text(encoding="utf-8")
+    log_files = [log_path] + [
+        log_path.with_name(log_path.name + f".{i}") for i in range(1, server.LOG_ROTATE_COUNT + 1)
+    ]
+    entries = []
+    for lf in log_files:
+        if lf.exists():
+            for line in lf.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    entries.append(json.loads(line))
+
+    assert any(entry.get("event") == "stdout" for entry in entries)
+    assert any(entry.get("event") == "stderr" for entry in entries)
+    assert all("level" in entry for entry in entries)
 
     assert not list(tmp_path.glob("*.last_message.md"))
+
+
+@pytest.mark.asyncio
+async def test_spawn_agents_parallel_respects_max_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
+    concurrency_state = {"active": 0, "max": 0}
+    lock = asyncio.Lock()
+
+    async def fake_spawn_agent(ctx: server.Context, prompt: str, **_: object) -> str:  # type: ignore[override]
+        async with lock:
+            concurrency_state["active"] += 1
+            concurrency_state["max"] = max(concurrency_state["max"], concurrency_state["active"])
+
+        await asyncio.sleep(0.05)
+
+        async with lock:
+            concurrency_state["active"] -= 1
+
+        return f"ok:{prompt}"
+
+    monkeypatch.setattr(server, "spawn_agent", fake_spawn_agent)
+
+    ctx = DummyContext()
+    agent_specs = [{"prompt": f"task {i}"} for i in range(5)]
+
+    results = await server.spawn_agents_parallel(ctx, agent_specs, max_parallel=2)
+
+    assert concurrency_state["max"] <= 2
+    assert sorted(result["index"] for result in results) == [str(i) for i in range(len(agent_specs))]
+    assert all(result.get("output", "").startswith("ok:") for result in results)

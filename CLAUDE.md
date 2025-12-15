@@ -76,8 +76,9 @@ twine upload dist/* --username "$PYPI_USERNAME" --password "$PYPI_TOKEN" --non-i
      - `model`: Optional. Override Codex model (e.g., "o3-mini", "o1-preview")
    - Command: `codex e --cd <work_dir> --skip-git-repo-check --full-auto [--model <model>] [-c model_reasoning_effort=<level>] --output-last-message <temp_file> "<prompt>"`
 
-2. **`spawn_agents_parallel(agents: list[dict])`**
+2. **`spawn_agents_parallel(agents: list[dict], max_parallel: int | None = None)`**
    - Spawns multiple Codex agents concurrently using `asyncio.gather`
+   - Optional `max_parallel` caps simultaneous agents via `asyncio.Semaphore` (default `None` = no limit)
    - Each agent spec is a dict with `prompt` and optional `reasoning_effort`, `model`
    - Returns list of results with `index`, `output`/`error`, and `log_file` fields
    - **Example:**
@@ -96,6 +97,23 @@ twine upload dist/* --username "$PYPI_USERNAME" --password "$PYPI_TOKEN" --non-i
 - Filename format: `codex_agent_<timestamp>_<pid>_[agent_index]_<uuid>.log`
 - Temporary output files cleaned up after agent completes
 - Recent 50 lines kept in memory for error reporting
+
+### Error Handling
+
+- Tool failures raise `ToolExecutionError`; FastMCP surfaces these as `CallToolResult.isError=true` with JSON text in the content block.
+- Payload shape:
+  ```json
+  {
+    "code": "agent_timeout",
+    "kind": "timeout_error",
+    "message": "Codex agent timed out after 300 seconds.",
+    "log_file": "/home/user/.cache/codex-as-mcp/logs/codex_agent_*.log",
+    "details": { "timeout_seconds": 300, "elapsed_seconds": 301.2 }
+  }
+  ```
+- Error categories (`kind`): `validation_error`, `runtime_error`, `timeout_error`, `io_error`.
+- Common codes: `invalid_prompt_type`, `empty_prompt`, `codex_not_found`, `process_start_failed`, `agent_timeout`, `agent_non_zero_exit`, `output_missing`, `output_read_failed`.
+- `spawn_agents_parallel` aggregates per-agent errors using the same payload structure and still includes a `log_file` entry when available. Batch-level validation issues (empty list, invalid `max_parallel`) raise `ToolExecutionError`.
 
 ### Progress Reporting
 

@@ -1,8 +1,15 @@
 {
   "mcpServers": {
-    "codex-subagent": {
+    "codex": {
+      "type": "stdio",
       "command": "uv",
-      "args": ["run", "python", "/Users/kky/Projects/codex-as-mcp/src/codex_as_mcp/server.py"]
+      "args": ["run", "python", "-m", "codex_as_mcp"],
+      "cwd": "/home/martinm/programme/Projekte/codex-as-mcp",
+      "env": {
+        "MCP_SERVER_REQUEST_TIMEOUT": "300000",
+        "MCP_REQUEST_TIMEOUT_RESET_ON_PROGRESS": "true",
+        "MCP_REQUEST_MAX_TOTAL_TIMEOUT": "28800000"
+      }
     }
   }
 }
