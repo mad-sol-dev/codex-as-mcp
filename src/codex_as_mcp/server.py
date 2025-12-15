@@ -86,7 +86,8 @@ def _allocate_log_paths(agent_index: int | None) -> tuple[Path, Path]:
 async def spawn_agent(
     ctx: Context,
     prompt: str,
-    timeout_seconds: float | int | None = DEFAULT_TIMEOUT_SECONDS,
+    reasoning_effort: str | None = None,
+    model: str | None = None,
     agent_index: int | None = None,
     agent_count: int | None = None,
 ) -> str:
@@ -97,8 +98,14 @@ async def spawn_agent(
 
     Args:
         prompt: All instructions/context the agent needs for the task.
-        timeout_seconds: Max seconds to allow the Codex CLI to run. Defaults to
-            ``DEFAULT_TIMEOUT_SECONDS``.
+        reasoning_effort: Reasoning level for the task. Defaults to env var
+            CODEX_REASONING_EFFORT or Codex's default.
+            - "low": Fast, simple tasks (file operations, basic edits)
+            - "medium": Balanced approach (default, most tasks)
+            - "high": Complex analysis (architecture design, debugging)
+            - "xhigh": Very complex (reverse engineering, security analysis)
+        model: Override the Codex model. Defaults to user's config (~/.codex/config.toml).
+            Examples: "o3-mini", "o1-preview", "gpt-5.1-codex-max"
 
     Returns:
         The agent's final response (clean output from Codex CLI) with the log
@@ -110,14 +117,16 @@ async def spawn_agent(
     if not prompt.strip():
         return "Error: 'prompt' is required and cannot be empty."
 
-    if timeout_seconds is None:
-        timeout_seconds = DEFAULT_TIMEOUT_SECONDS
-    try:
-        timeout_seconds = float(timeout_seconds)
-        if timeout_seconds <= 0:
-            raise ValueError
-    except (ValueError, TypeError):
-        return "Error: 'timeout_seconds' must be a positive number."
+    # Get timeout from environment variable or use default
+    timeout_seconds = DEFAULT_TIMEOUT_SECONDS
+    timeout_env = os.environ.get("CODEX_TIMEOUT_SECONDS")
+    if timeout_env:
+        try:
+            timeout_seconds = float(timeout_env)
+            if timeout_seconds <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            pass  # Silently fall back to default on invalid value
 
     try:
         codex_exec = _resolve_codex_executable()
@@ -153,8 +162,19 @@ async def spawn_agent(
         "--full-auto",
         "--output-last-message",
         str(output_path),
-        quoted_prompt,
     ]
+
+    # Add model override if specified (parameter takes precedence over env var)
+    model_to_use = model or os.environ.get("CODEX_MODEL")
+    if model_to_use:
+        cmd.extend(["-m", model_to_use])
+
+    # Add reasoning_effort config (parameter > env var > codex default)
+    reasoning_to_use = reasoning_effort or os.environ.get("CODEX_REASONING_EFFORT")
+    if reasoning_to_use:
+        cmd.extend(["-c", f"model_reasoning_effort={reasoning_to_use}"])
+
+    cmd.append(quoted_prompt)
 
     try:
         # Initial progress ping
@@ -332,7 +352,6 @@ async def spawn_agent(
 async def spawn_agents_parallel(
     ctx: Context,
     agents: list[dict[str, str]],
-    timeout_seconds: float | int | None = DEFAULT_TIMEOUT_SECONDS,
 ) -> list[dict[str, str]]:
     """Spawn multiple Codex agents in parallel.
 
@@ -341,13 +360,12 @@ async def spawn_agents_parallel(
 
     Args:
         agents: List of agent specs, each with a 'prompt' entry and optional
-            'timeout_seconds' override.
+            'reasoning_effort' and 'model' overrides.
                 Example: [
                     {"prompt": "Create math.md"},
-                    {"prompt": "Create story.md", "timeout_seconds": 600}
+                    {"prompt": "Analyze binary", "reasoning_effort": "high"},
+                    {"prompt": "Debug issue", "model": "o3-mini"}
                 ]
-        timeout_seconds: Default max seconds for each agent unless overridden
-            per spec. Defaults to ``DEFAULT_TIMEOUT_SECONDS``.
 
     Returns:
         List of results with 'index', 'output', and optional 'error' and
@@ -370,6 +388,8 @@ async def spawn_agents_parallel(
                 }
 
             prompt = spec.get("prompt", "")
+            reasoning_effort = spec.get("reasoning_effort")
+            model = spec.get("model")
 
             # Report progress for this agent
             try:
@@ -381,13 +401,12 @@ async def spawn_agents_parallel(
             except Exception:
                 pass
 
-            agent_timeout = spec.get("timeout_seconds", timeout_seconds)
-
             # Run the agent
             output = await spawn_agent(
                 ctx,
                 prompt,
-                agent_timeout,
+                reasoning_effort=reasoning_effort,
+                model=model,
                 agent_index=index,
                 agent_count=len(agents),
             )
