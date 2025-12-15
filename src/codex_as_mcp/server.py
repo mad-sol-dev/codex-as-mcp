@@ -326,7 +326,38 @@ async def spawn_agent(
             if task:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
-        output = output_path.read_text(encoding="utf-8").strip()
+
+        # Log completion
+        await _write_log("info", f"Codex agent process completed with exit code: {returncode}")
+
+        # Robustly read output file with retries (Codex might still be flushing)
+        output = ""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if output_path.exists():
+                    file_size = output_path.stat().st_size
+                    await _write_log("info", f"Output file exists, size: {file_size} bytes (attempt {attempt + 1}/{max_retries})")
+
+                    # Wait a moment for file system flush
+                    if attempt > 0:
+                        await asyncio.sleep(0.5)
+
+                    output = output_path.read_text(encoding="utf-8", errors="replace").strip()
+                    if output:
+                        break  # Success
+                    elif attempt < max_retries - 1:
+                        await _write_log("warning", f"Output file empty on attempt {attempt + 1}, retrying...")
+                    else:
+                        await _write_log("warning", "Output file is empty after all retries")
+                else:
+                    await _write_log("error", f"Output file does not exist: {output_path}")
+                    break
+            except Exception as e:
+                await _write_log("error", f"Failed to read output file (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5)
+                break
 
         if returncode != 0:
             details = [
@@ -341,11 +372,32 @@ async def spawn_agent(
             details.append(log_note)
             return "\n".join(details)
 
-        return "\n".join([output, log_note]) if output else log_note
+        # Return output if available, otherwise include recent lines as fallback
+        if output:
+            return "\n".join([output, log_note])
+        elif recent_lines:
+            # Fallback: if output file is empty but we have stdout/stderr
+            await _write_log("warning", "Output file empty, using recent lines as fallback")
+            return "\n".join([
+                "Warning: Codex agent completed but output file was empty.",
+                "Recent output:",
+                "\n".join(recent_lines[-20:]),  # Last 20 lines
+                log_note
+            ])
+        else:
+            return f"Warning: Codex agent completed but produced no output.\n{log_note}"
     finally:
-        with contextlib.suppress(Exception):
-            if output_path.exists():
-                output_path.unlink()
+        # Ensure cleanup happens even on exceptions
+        cleanup_retries = 3
+        for cleanup_attempt in range(cleanup_retries):
+            try:
+                if output_path.exists():
+                    output_path.unlink()
+                    break
+            except Exception as cleanup_error:
+                if cleanup_attempt < cleanup_retries - 1:
+                    await asyncio.sleep(0.2)
+                # Silently fail on last attempt - file will be cleaned up later
 
 
 @mcp.tool()
