@@ -24,6 +24,7 @@ class FakeProcess:
     ) -> None:
         self.stdout = asyncio.StreamReader()
         self.stderr = asyncio.StreamReader()
+        self.pid = 12345  # Fake PID for testing
 
         for chunk in stdout_chunks or []:
             self.stdout.feed_data(chunk)

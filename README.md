@@ -1,11 +1,13 @@
 # codex-as-mcp
 
-Minimal MCP server that lets you spawn Codex agents from any MCP client. Five tools are exposed:
+Minimal MCP server that lets you spawn Codex agents from any MCP client. Seven tools are exposed:
 - `spawn_agent` (blocking) - Runs a single Codex agent and waits for completion
 - `spawn_agent_async` (non-blocking) - Starts an agent in the background, returns immediately
 - `get_agent_status` - Check status of async agents
 - `list_agent_tasks` - List all running/completed async tasks
 - `spawn_agents_parallel` - Launches multiple Codex agents concurrently
+- `list_agent_logs` - List recent agent log files with size and timestamps
+- `cleanup_old_logs` - Delete old log files to free up space
 
 [中文版](./README.zh-CN.md)
 
@@ -113,11 +115,134 @@ See [CLAUDE.md](./CLAUDE.md) for detailed documentation.
 
 **Parameters:**
 - `reasoning_effort`: `"low"` (fast), `"medium"` (default), `"high"` (complex), `"xhigh"` (very complex)
-- `model`: Override Codex model (e.g., `"o3-mini"`, `"o1-preview"`)
+- `model`: Override Codex model (e.g., `"gpt-5.2-codex"`, `"gpt-5.1-codex-mini"`)
 
 **Logs**: All agent activity is logged to `~/.cache/codex-as-mcp/logs/` in a human-readable format. Monitor live with:
 ```bash
 tail -f ~/.cache/codex-as-mcp/logs/codex_agent_*.log
+```
+
+## Examples
+
+### Basic Usage (Default Model)
+
+```python
+# Simple task with default settings (gpt-5.2-codex, medium reasoning)
+spawn_agent("Analyze the codebase and create a summary in SUMMARY.md")
+```
+
+### Using Different Models
+
+```python
+# Fast, cost-effective model for simple tasks
+spawn_agent(
+    "Fix typos in README.md",
+    model="gpt-5.1-codex-mini",
+    reasoning_effort="low"
+)
+
+# Most advanced model for complex analysis
+spawn_agent(
+    "Refactor authentication system with proper error handling",
+    model="gpt-5.2-codex",
+    reasoning_effort="high"
+)
+
+# Balanced model for most tasks
+spawn_agent(
+    "Add unit tests for user service",
+    model="gpt-5.1-codex-max",
+    reasoning_effort="medium"
+)
+```
+
+### Async Workflow (Claude Desktop)
+
+```python
+# Start complex task in background
+result = spawn_agent_async(
+    "Analyze all API endpoints and generate OpenAPI spec",
+    model="gpt-5.2-codex",
+    reasoning_effort="high"
+)
+
+# Get task ID
+task_id = result["task_id"]
+log_file = result["log_file"]
+
+# Monitor progress (optional)
+# You can read the log file to see what the agent is doing
+read_file(log_file)
+
+# Check status periodically (wait at least 30 seconds between checks)
+status = get_agent_status(task_id)
+
+# When complete, get output
+if status["status"] == "completed":
+    print(status["output"])
+```
+
+### Parallel Execution
+
+```python
+# Run multiple agents concurrently
+agents = [
+    {
+        "prompt": "Update all dependencies in package.json",
+        "model": "gpt-5.1-codex-mini",
+        "reasoning_effort": "low"
+    },
+    {
+        "prompt": "Analyze security vulnerabilities in authentication code",
+        "model": "gpt-5.2-codex",
+        "reasoning_effort": "high"
+    },
+    {
+        "prompt": "Generate API documentation from code comments",
+        "model": "gpt-5.1-codex-max",
+        "reasoning_effort": "medium"
+    }
+]
+
+# Run all agents (max 2 at a time)
+results = spawn_agents_parallel(agents, max_parallel=2)
+
+# Check results
+for result in results:
+    if "output" in result:
+        print(f"Agent {result['index']}: {result['output']}")
+    else:
+        print(f"Agent {result['index']} failed: {result['error']}")
+```
+
+### Available Models
+
+| Model | Best For | Cost | Speed |
+|-------|----------|------|-------|
+| `gpt-5.2-codex` | Complex tasks, long-horizon work, large code changes | Higher | Slower |
+| `gpt-5.1-codex-max` | Balanced performance, agentic tasks | Medium | Medium |
+| `gpt-5.1-codex-mini` | Simple tasks, quick fixes, cost-sensitive work | Lower (~4x more usage) | Faster |
+| `gpt-5.2` | General purpose (Windows default) | Medium | Medium |
+| `gpt-5-codex` | macOS/Linux default | Medium | Medium |
+
+**Note:** Models like `o3-mini`, `o1-preview`, or `codex-1` are **NOT** supported in Codex CLI. Always use the `gpt-5.x-codex` variants.
+
+### Log Management
+
+```python
+# List recent log files
+logs = list_agent_logs(max_count=10)
+print(f"Total logs: {logs['total']}")
+for log in logs['logs']:
+    print(f"{log['path']} - {log['size_human']} - {log['modified']}")
+
+# Clean up old logs (dry run first)
+result = cleanup_old_logs(days=7, dry_run=True)
+print(f"Would delete {result['deleted_count']} files, freeing {result['freed_human']}")
+
+# Actually delete old logs
+result = cleanup_old_logs(days=7, dry_run=False)
+print(f"Deleted {result['deleted_count']} files, freed {result['freed_human']}")
 ```
 
 ## Configuration

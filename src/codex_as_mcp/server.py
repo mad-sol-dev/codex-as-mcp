@@ -43,6 +43,11 @@ DEFAULT_LOG_ROOT = Path.home() / ".cache" / "codex-as-mcp" / "logs"
 LOG_ROTATE_BYTES = 1_000_000
 LOG_ROTATE_COUNT = 5
 
+# Output size limit to prevent Claude Desktop sync issues
+# Claude Desktop has response size limits that cause "message_store_sync_loss"
+# when exceeded, leading to conversation deletion
+MAX_OUTPUT_LENGTH = 4000  # characters
+
 
 mcp = FastMCP("codex-subagent")
 
@@ -236,7 +241,7 @@ async def _run_codex_agent(
         ctx: MCP context for progress reporting (optional, can be None for background tasks)
         prompt: All instructions/context the agent needs
         reasoning_effort: "low", "medium", "high", or "xhigh"
-        model: Model override (e.g., "o3-mini", "o1-preview")
+        model: Model override (e.g., "gpt-5.2-codex", "gpt-5.1-codex-mini")
         agent_index: Index of this agent (for parallel execution)
         agent_count: Total number of agents (for parallel execution)
 
@@ -701,9 +706,22 @@ async def _run_codex_agent(
             )
 
         # Return output if available, otherwise include recent lines as fallback
+        # IMPORTANT: Truncate output to prevent Claude Desktop sync issues
         if output_error and returncode == 0:
             raise output_error
         if output:
+            # Truncate if output exceeds Claude Desktop's sync limit
+            if len(output) > MAX_OUTPUT_LENGTH:
+                truncated = output[:MAX_OUTPUT_LENGTH]
+                truncation_note = f"\n\n[Output truncated: {len(output)} chars total, showing first {MAX_OUTPUT_LENGTH}. See full output in log file]"
+                await _write_log(
+                    "info",
+                    "output_truncated",
+                    f"Output truncated from {len(output)} to {MAX_OUTPUT_LENGTH} chars to prevent Claude Desktop sync issues",
+                    {**base_context, "original_length": len(output), "truncated_length": MAX_OUTPUT_LENGTH},
+                    as_json=True,
+                )
+                return "\n".join([truncated, truncation_note, log_note])
             return "\n".join([output, log_note])
         elif recent_lines:
             # Fallback: if output file is empty but we have stdout/stderr
@@ -714,10 +732,14 @@ async def _run_codex_agent(
                 {**base_context, "recent_line_count": len(recent_lines)},
                 as_json=True,  # Important warning
             )
+            recent_output = "\n".join(list(recent_lines)[-20:])  # Last 20 lines
+            # Truncate fallback output too
+            if len(recent_output) > MAX_OUTPUT_LENGTH:
+                recent_output = recent_output[:MAX_OUTPUT_LENGTH] + "\n[Truncated]"
             return "\n".join([
                 "Warning: Codex agent completed but output file was empty.",
                 "Recent output:",
-                "\n".join(list(recent_lines)[-20:]),  # Last 20 lines
+                recent_output,
                 log_note
             ])
         else:
@@ -771,7 +793,7 @@ async def spawn_agent(
             - "high": Complex analysis (architecture design, debugging)
             - "xhigh": Very complex (reverse engineering, security analysis)
         model: Override the Codex model. Defaults to user's config (~/.codex/config.toml).
-            Examples: "o3-mini", "o1-preview", "gpt-5.1-codex-max"
+            Examples: "gpt-5.2-codex", "gpt-5.1-codex-max", "gpt-5.1-codex-mini"
 
     Returns:
         The agent's final response (clean output from Codex CLI) with the log
@@ -806,7 +828,7 @@ async def spawn_agent_async(
     Args:
         prompt: All instructions/context the agent needs for the task.
         reasoning_effort: Reasoning level ("low", "medium", "high", "xhigh")
-        model: Override the Codex model (e.g., "o3-mini", "o1-preview")
+        model: Override the Codex model (e.g., "gpt-5.2-codex", "gpt-5.1-codex-mini")
 
     Returns:
         dict with:
@@ -892,12 +914,17 @@ Do NOT ask for further instructions or wait for user input."""
         "elapsed_seconds": None,
     }
 
+    # Small delay before returning to allow task to initialize
+    # This prevents potential issues with immediate Claude Desktop sync
+    await asyncio.sleep(1.5)
+
     # Return immediately
     return {
         "task_id": task_id,
         "status": "running",
         "log_file": str(log_file),
         "started_at": started_at,
+        "note": "Task is running in background. DO NOT poll immediately - wait at least 30 seconds before checking status. Most tasks take 30-120 seconds.",
     }
 
 
@@ -921,6 +948,7 @@ async def get_agent_status(task_id: str) -> dict[str, Any]:
         - elapsed_seconds: Runtime in seconds (only if completed/failed)
         - output: Agent's final response (only if status="completed")
         - error: Error details (only if status="failed")
+        - warning: Warning message if polling too frequently
     """
     if task_id not in running_tasks:
         raise ToolExecutionError(
@@ -936,6 +964,20 @@ async def get_agent_status(task_id: str) -> dict[str, Any]:
         "log_file": info["log_file"],
         "started_at": info["started_at"],
     }
+
+    # Calculate elapsed time
+    started_ts = datetime.fromisoformat(info["started_at"].replace("Z", "+00:00"))
+    elapsed = (datetime.now(started_ts.tzinfo) - started_ts).total_seconds()
+
+    # Warning if polling too early (task still running and started < 15 seconds ago)
+    if info["status"] == "running" and elapsed < 15:
+        result["warning"] = (
+            f"Task started only {elapsed:.1f}s ago. Most Codex tasks take 30-120 seconds. "
+            "Avoid frequent polling - wait at least 30 seconds between checks. "
+            "You can read the log file to monitor progress instead."
+        )
+
+    result["elapsed_seconds"] = round(elapsed, 1)
 
     if info["completed_at"]:
         result["completed_at"] = info["completed_at"]
@@ -1010,7 +1052,7 @@ async def spawn_agents_parallel(
                 Example: [
                     {"prompt": "Create math.md"},
                     {"prompt": "Analyze binary", "reasoning_effort": "high"},
-                    {"prompt": "Debug issue", "model": "o3-mini"}
+                    {"prompt": "Debug issue", "model": "gpt-5.1-codex-mini"}
                 ]
         max_parallel: Optional limit on how many agents run concurrently.
             If ``None`` (default), all agents run at once.
@@ -1127,6 +1169,116 @@ async def spawn_agents_parallel(
             final_results.append(result)
 
     return final_results
+
+
+@mcp.tool()
+async def list_agent_logs(max_count: int = 20) -> dict[str, Any]:
+    """List recent agent log files.
+
+    Args:
+        max_count: Maximum number of log files to return (default: 20)
+
+    Returns:
+        dict with:
+        - total: Total number of log files found
+        - logs: List of log file info (path, size, modified time)
+        - log_dir: Path to log directory
+    """
+    try:
+        log_root = _prepare_log_root()
+
+        # Find all .log files (excluding rotated .log.N files for simplicity)
+        log_files = sorted(
+            log_root.glob("codex_agent_*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True  # Most recent first
+        )[:max_count]
+
+        logs_info = []
+        for log_file in log_files:
+            stat = log_file.stat()
+            logs_info.append({
+                "path": str(log_file),
+                "size_bytes": stat.st_size,
+                "size_human": f"{stat.st_size / 1024:.1f} KB" if stat.st_size < 1024 * 1024 else f"{stat.st_size / (1024 * 1024):.1f} MB",
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            })
+
+        total_logs = len(list(log_root.glob("codex_agent_*.log")))
+
+        return {
+            "total": total_logs,
+            "showing": len(logs_info),
+            "log_dir": str(log_root),
+            "logs": logs_info,
+        }
+    except Exception as e:
+        raise ToolExecutionError(
+            code="list_logs_failed",
+            kind=ErrorCategory.IO,
+            message="Failed to list agent logs",
+            details={"error": str(e)},
+        )
+
+
+@mcp.tool()
+async def cleanup_old_logs(days: int = 7, dry_run: bool = True) -> dict[str, Any]:
+    """Delete agent log files older than specified number of days.
+
+    Args:
+        days: Delete logs older than this many days (default: 7)
+        dry_run: If True, only report what would be deleted without deleting (default: True)
+
+    Returns:
+        dict with:
+        - deleted_count: Number of files deleted (or would be deleted)
+        - freed_bytes: Bytes freed (or would be freed)
+        - files: List of deleted file paths
+        - dry_run: Whether this was a dry run
+    """
+    if days < 1:
+        raise ToolExecutionError(
+            code="invalid_days",
+            kind=ErrorCategory.VALIDATION,
+            message="'days' must be at least 1",
+        )
+
+    try:
+        log_root = _prepare_log_root()
+        cutoff_time = time.time() - (days * 24 * 60 * 60)
+
+        # Find all old log files (including rotated ones)
+        old_logs = [
+            p for p in log_root.glob("codex_agent_*")
+            if p.is_file() and p.stat().st_mtime < cutoff_time
+        ]
+
+        deleted_files = []
+        freed_bytes = 0
+
+        for log_file in old_logs:
+            size = log_file.stat().st_size
+            freed_bytes += size
+            deleted_files.append(str(log_file))
+
+            if not dry_run:
+                log_file.unlink()
+
+        return {
+            "deleted_count": len(deleted_files),
+            "freed_bytes": freed_bytes,
+            "freed_human": f"{freed_bytes / 1024:.1f} KB" if freed_bytes < 1024 * 1024 else f"{freed_bytes / (1024 * 1024):.1f} MB",
+            "files": deleted_files,
+            "dry_run": dry_run,
+            "message": f"{'Would delete' if dry_run else 'Deleted'} {len(deleted_files)} log files older than {days} days",
+        }
+    except Exception as e:
+        raise ToolExecutionError(
+            code="cleanup_failed",
+            kind=ErrorCategory.IO,
+            message="Failed to cleanup old logs",
+            details={"error": str(e)},
+        )
 
 
 def main() -> None:

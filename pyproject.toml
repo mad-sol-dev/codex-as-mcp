@@ -18,6 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "mcp[cli]>=1.12.4",
+    "pydantic>=2.9.2",
 ]
 
 [project.scripts]

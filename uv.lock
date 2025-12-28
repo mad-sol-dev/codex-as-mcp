@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11"
 
 [[package]]
@@ -151,6 +151,7 @@ version = "2025.10.20.1"
 source = { editable = "." }
 dependencies = [
     { name = "mcp", extra = ["cli"] },
+    { name = "pydantic" },
 ]
 
 [package.dev-dependencies]
@@ -161,7 +162,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mcp", extras = ["cli"], specifier = ">=1.12.4" }]
+requires-dist = [
+    { name = "mcp", extras = ["cli"], specifier = ">=1.12.4" },
+    { name = "pydantic", specifier = ">=2.9.2" },
+]
 
 [package.metadata.requires-dev]
 dev = [

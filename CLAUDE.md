@@ -56,11 +56,12 @@ twine upload dist/* --username "$PYPI_USERNAME" --password "$PYPI_TOKEN" --non-i
 ### Core Components
 
 - **`src/codex_as_mcp/server.py`**: Main MCP server implementation using FastMCP
-  - Exposes 5 tools: `spawn_agent`, `spawn_agent_async`, `get_agent_status`, `list_agent_tasks`, `spawn_agents_parallel`
+  - Exposes 7 tools: `spawn_agent`, `spawn_agent_async`, `get_agent_status`, `list_agent_tasks`, `spawn_agents_parallel`, `list_agent_logs`, `cleanup_old_logs`
   - Manages Codex CLI subprocess execution with stdout/stderr capture
   - Implements log rotation and persistent logging to `~/.cache/codex-as-mcp/logs`
   - Progress reporting via MCP context with heartbeats every 2 seconds
   - Async task tracking for background agent execution
+  - **Output size protection**: Automatically truncates responses >4000 chars to prevent Claude Desktop sync issues
 
 - **`src/codex_as_mcp/__main__.py`**: Entry point for `python -m codex_as_mcp`
 
@@ -87,7 +88,7 @@ spawn_agent(
 - **Parameters:**
   - `prompt`: Instructions for the agent
   - `reasoning_effort`: Optional. "low", "medium", "high", or "xhigh"
-  - `model`: Optional. Override Codex model (e.g., "o3-mini", "o1-preview")
+  - `model`: Optional. Override Codex model (e.g., "gpt-5.2-codex", "gpt-5.1-codex-mini")
   - `agent_index`, `agent_count`: For parallel execution tracking
 - Command: `codex e --cd <work_dir> --skip-git-repo-check --full-auto [--model <model>] [-c model_reasoning_effort=<level>] --output-last-message <temp_file> "<prompt>"`
 
@@ -162,9 +163,43 @@ spawn_agents_parallel(
   [
     {"prompt": "Create math.md"},
     {"prompt": "Analyze binary", "reasoning_effort": "high"},
-    {"prompt": "Debug issue", "model": "o3-mini"}
+    {"prompt": "Debug issue", "model": "gpt-5.1-codex-mini"}
   ]
   ```
+
+#### 6. `list_agent_logs` - List recent log files
+
+```python
+list_agent_logs(max_count: int = 20) -> dict
+```
+
+- Lists recent agent log files sorted by modification time (most recent first)
+- Returns log file paths, sizes, and modification timestamps
+- Useful for finding logs to inspect or cleanup
+- **Returns:**
+  - `total`: Total number of log files
+  - `showing`: Number of logs returned
+  - `log_dir`: Path to log directory
+  - `logs`: List of log file info (path, size_bytes, size_human, modified)
+
+#### 7. `cleanup_old_logs` - Delete old log files
+
+```python
+cleanup_old_logs(days: int = 7, dry_run: bool = True) -> dict
+```
+
+- Deletes agent log files older than specified number of days
+- **Default is dry_run=True** - only reports what would be deleted without deleting
+- Set `dry_run=False` to actually delete files
+- Returns count of deleted files and bytes freed
+- **Parameters:**
+  - `days`: Delete logs older than this many days (default: 7, minimum: 1)
+  - `dry_run`: If True, only report what would be deleted (default: True)
+- **Returns:**
+  - `deleted_count`: Number of files deleted (or would be deleted)
+  - `freed_bytes` / `freed_human`: Bytes freed
+  - `files`: List of deleted file paths
+  - `dry_run`: Whether this was a dry run
 
 ### Logging System
 
@@ -198,6 +233,29 @@ This dual-format approach makes logs:
 - **Readable**: Easy to monitor with `tail -f ~/.cache/codex-as-mcp/logs/codex_agent_*.log`
 - **Compact**: Only logs changes, not repetitive progress updates
 - **Structured**: JSON for machine-readable events when needed
+
+### Output Size Protection
+
+**Problem:** Claude Desktop has response size limits that cause `message_store_sync_loss` errors when exceeded, leading to conversation deletion.
+
+**Solution:** Automatic output truncation to prevent sync issues.
+
+- **Maximum output length**: 4000 characters
+- **Behavior**: If Codex agent output exceeds 4000 chars, it's automatically truncated
+- **User notification**: Truncation message shows original length and directs to log file
+- **Log file**: Full untruncated output always available in log file
+- **Applies to**: All tool responses (`spawn_agent`, `spawn_agent_async` results, fallback outputs)
+
+**Example truncated response:**
+```
+Created analysis report with 50 findings...
+[... output continues ...]
+
+[Output truncated: 8542 chars total, showing first 4000. See full output in log file]
+Log file: /home/user/.cache/codex-as-mcp/logs/codex_agent_20251228_151347_564689_bdf52cd9.log
+```
+
+**Recommendation:** For tasks that produce large outputs, use `spawn_agent_async` and read the log file directly with the Read tool while the task runs, or after completion.
 
 ### Error Handling
 
@@ -238,16 +296,22 @@ The MCP tools support per-call configuration via parameters. This is the **recom
 **Note:** Higher reasoning effort increases latency and cost. Only use "high" or "xhigh" when task complexity justifies it.
 
 **`model` Parameter:**
-Examples: `"o3-mini"`, `"o1-preview"`, `"gpt-5.1-codex-max"`
+Examples: `"gpt-5.2-codex"`, `"gpt-5.1-codex-max"`, `"gpt-5.1-codex-mini"`
 
-Use when specific model capabilities are needed (e.g., o3 models for extended reasoning).
+**Available Models:**
+- `gpt-5.2-codex` - Latest, most advanced model
+- `gpt-5.1-codex-max` - Based on improved foundational reasoning model
+- `gpt-5.1-codex-mini` - Smaller, cost-effective (~4x more usage)
+- `gpt-5.2`, `gpt-5.1`, `gpt-5.1-codex`, `gpt-5-codex`, `gpt-5-codex-mini`, `gpt-5` - Alternative models
+
+**Note:** Models like `o3-mini` or `o1-preview` are NOT supported in Codex CLI. Use the gpt-5.x-codex variants instead.
 
 **Example MCP tool call:**
 ```python
 await mcp.call_tool("spawn_agent", {
     "prompt": "Analyze this binary for SD card write operations",
     "reasoning_effort": "high",
-    "model": "gpt-5.1-codex-max"
+    "model": "gpt-5.2-codex"
 })
 ```
 
