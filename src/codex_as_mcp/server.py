@@ -46,6 +46,9 @@ LOG_ROTATE_COUNT = 5
 
 mcp = FastMCP("codex-subagent")
 
+# Global task tracking for async agent spawning
+running_tasks: dict[str, dict[str, Any]] = {}
+
 
 class ErrorCategory(str, Enum):
     VALIDATION = "validation_error"
@@ -183,48 +186,62 @@ def _format_log_line(
     event: str,
     message: str,
     context: Optional[dict] = None,
+    human_readable: bool = True,
 ) -> str:
-    payload = {
-        "ts": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
-        "level": level,
-        "event": event,
-        "message": message,
-    }
-    if context:
-        payload["context"] = context
-    return json.dumps(payload, ensure_ascii=False) + "\n"
+    """Format a log line. By default, use human-readable text format.
+
+    Args:
+        level: Log level (info, warning, error)
+        event: Event type (agent_start, stdout, stderr, progress, etc.)
+        message: The message to log
+        context: Optional context dict (only used for JSON format)
+        human_readable: If True, use simple text format. If False, use JSON.
+
+    Returns:
+        Formatted log line with newline
+    """
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    if human_readable:
+        # Simple text format: [timestamp] LEVEL event: message
+        level_str = level.upper().ljust(7)
+        return f"[{timestamp}] {level_str} {event}: {message}\n"
+    else:
+        # JSON format for structured logging (used for important events)
+        payload = {
+            "ts": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+            "level": level,
+            "event": event,
+            "message": message,
+        }
+        if context:
+            payload["context"] = context
+        return json.dumps(payload, ensure_ascii=False) + "\n"
 
 
-@mcp.tool()
-async def spawn_agent(
-    ctx: Context,
+async def _run_codex_agent(
+    ctx: Optional[Context],
     prompt: str,
     reasoning_effort: Optional[str] = None,
     model: Optional[str] = None,
     agent_index: Optional[int] = None,
     agent_count: Optional[int] = None,
 ) -> str:
-    """Spawn a Codex agent to work inside the configured working directory.
+    """Internal function that runs a Codex agent.
 
-    The server resolves the working directory via ``CODEX_AGENT_CWD`` if set,
-    otherwise ``os.getcwd()`` so it inherits whatever environment the MCP
-    process currently has. Use the environment variable when the server runs
-    from one location but you want agents to work in another workspace.
+    This is the core implementation used by both spawn_agent (blocking)
+    and spawn_agent_async (non-blocking).
 
     Args:
-        prompt: All instructions/context the agent needs for the task.
-        reasoning_effort: Reasoning level for the task. Defaults to env var
-            CODEX_REASONING_EFFORT or Codex's default.
-            - "low": Fast, simple tasks (file operations, basic edits)
-            - "medium": Balanced approach (default, most tasks)
-            - "high": Complex analysis (architecture design, debugging)
-            - "xhigh": Very complex (reverse engineering, security analysis)
-        model: Override the Codex model. Defaults to user's config (~/.codex/config.toml).
-            Examples: "o3-mini", "o1-preview", "gpt-5.1-codex-max"
+        ctx: MCP context for progress reporting (optional, can be None for background tasks)
+        prompt: All instructions/context the agent needs
+        reasoning_effort: "low", "medium", "high", or "xhigh"
+        model: Model override (e.g., "o3-mini", "o1-preview")
+        agent_index: Index of this agent (for parallel execution)
+        agent_count: Total number of agents (for parallel execution)
 
     Returns:
-        The agent's final response (clean output from Codex CLI) with the log
-        file path appended, or a clear timeout/error message.
+        The agent's final response with log file path appended
     """
     log_file: Path | None = None
     output_path: Path | None = None
@@ -324,14 +341,21 @@ async def spawn_agent(
     bytes_seen = 0
     last_non_empty_line = ""
 
-    async def _write_log(level: str, event: str, message: str, context: Optional[dict] = None) -> None:
+    async def _write_log(
+        level: str,
+        event: str,
+        message: str,
+        context: Optional[dict] = None,
+        as_json: bool = False,
+    ) -> None:
+        """Write a log entry. Use as_json=True for important events, False for streaming output."""
         nonlocal bytes_seen
         async with log_lock:
             try:
                 _rotate_logs(log_file, max_log_bytes, LOG_ROTATE_COUNT)
             except Exception:
                 pass
-            entry = _format_log_line(level, event, message, context)
+            entry = _format_log_line(level, event, message, context, human_readable=not as_json)
             with log_file.open("a", encoding="utf-8") as handle:
                 handle.write(entry)
             bytes_seen += len(entry.encode("utf-8", errors="replace"))
@@ -339,21 +363,24 @@ async def spawn_agent(
     start_time = time.monotonic()
 
     try:
+        # Log start as JSON (important event)
         await _write_log(
             "info",
             "agent_start",
-            "Launching Codex agent",
+            f"Launching Codex agent (timeout: {timeout_seconds}s)",
             {**base_context, "timeout_seconds": timeout_seconds},
+            as_json=True,
         )
         # Initial progress ping
-        try:
-            await ctx.report_progress(
-                agent_index if agent_index is not None else 0,
-                agent_count,
-                f"[{agent_label}] Launching Codex agent...",
-            )
-        except Exception:
-            pass
+        if ctx:
+            try:
+                await ctx.report_progress(
+                    agent_index if agent_index is not None else 0,
+                    agent_count,
+                    f"[{agent_label}] Launching Codex agent...",
+                )
+            except Exception:
+                pass
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -361,18 +388,22 @@ async def spawn_agent(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            # Log process start as JSON (important event)
             await _write_log(
                 "info",
                 "process_start",
-                "Codex agent subprocess started",
-                {**base_context, "command": cmd},
+                f"Codex agent subprocess started (PID: {proc.pid})",
+                {**base_context, "command": cmd, "pid": proc.pid},
+                as_json=True,
             )
         except Exception as e:
+            # Log error as JSON
             await _write_log(
                 "error",
                 "process_start_failed",
                 f"Failed to launch Codex agent: {e}",
                 {**base_context, "command": cmd},
+                as_json=True,
             )
             raise ToolExecutionError(
                 code="process_start_failed",
@@ -400,50 +431,84 @@ async def spawn_agent(
                 else:
                     stderr_lines += 1
                 if clean_line.strip():
-                    last_non_empty_line = f"{prefix}: {clean_line.strip()}"
+                    last_non_empty_line = clean_line.strip()
                 recent_lines.append(f"{prefix}: {clean_line}".rstrip())
+                # Log stdout/stderr as simple text (human-readable)
                 await _write_log(
                     "info",
                     prefix,
-                    f"{prefix}: {clean_line}",
-                    {**base_context, "stream": prefix},
+                    clean_line,  # Just the line, no prefix duplication
+                    as_json=False,  # Use text format for streaming output
                 )
 
         stop_progress = asyncio.Event()
+        last_logged_line = ""
+        last_log_time = start_time
+        warned_about_desktop_timeout = False
 
         async def _progress_reporter() -> None:
+            """Report progress every 2s via MCP, but only log when something changes or every 10s."""
+            nonlocal last_logged_line, last_log_time, warned_about_desktop_timeout
             while not stop_progress.is_set():
                 await asyncio.sleep(2)
                 elapsed = time.monotonic() - start_time
                 message_parts = [
                     f"[{agent_label}] {int(elapsed)}s elapsed",
-                    f"stdout lines={stdout_lines}",
-                    f"stderr lines={stderr_lines}",
-                    f"bytes={bytes_seen}",
+                    f"stdout={stdout_lines}",
+                    f"stderr={stderr_lines}",
                 ]
                 if last_non_empty_line:
-                    message_parts.append(f"last: {last_non_empty_line}")
-                try:
-                    await _write_log(
-                        "info",
-                        "progress",
-                        "; ".join(message_parts),
-                        {
-                            **base_context,
-                            "elapsed_seconds": round(elapsed, 2),
-                            "stdout_lines": stdout_lines,
-                            "stderr_lines": stderr_lines,
-                            "bytes_written": bytes_seen,
-                            "last_non_empty_line": last_non_empty_line or None,
-                        },
-                    )
-                    await ctx.report_progress(
-                        agent_index if agent_index is not None else 1,
-                        agent_count,
-                        "; ".join(message_parts),
-                    )
-                except Exception:
-                    pass
+                    message_parts.append(f"last: {last_non_empty_line[:80]}")
+
+                # Always send MCP progress (for timeout reset)
+                if ctx:
+                    try:
+                        await ctx.report_progress(
+                            agent_index if agent_index is not None else 1,
+                            agent_count,
+                            "; ".join(message_parts),
+                        )
+                    except Exception:
+                        pass
+
+                # Warn about Claude Desktop timeout at 50 seconds
+                if not warned_about_desktop_timeout and elapsed >= 50:
+                    warned_about_desktop_timeout = True
+                    try:
+                        await _write_log(
+                            "warning",
+                            "timeout_warning",
+                            "Task running >50s: Claude Desktop will timeout at ~60s. Use Claude Code CLI for long tasks. See CLAUDE.md",
+                            {
+                                **base_context,
+                                "elapsed_seconds": round(elapsed, 2),
+                                "desktop_timeout_at": 60,
+                            },
+                            as_json=True,  # Important warning
+                        )
+                    except Exception:
+                        pass
+
+                # Only write to log if:
+                # 1. last_non_empty_line changed, OR
+                # 2. 10 seconds passed since last log
+                should_log = (
+                    last_non_empty_line != last_logged_line or
+                    (elapsed - (last_log_time - start_time)) >= 10
+                )
+
+                if should_log:
+                    try:
+                        await _write_log(
+                            "info",
+                            "progress",
+                            "; ".join(message_parts),
+                            as_json=False,  # Use text format
+                        )
+                        last_logged_line = last_non_empty_line
+                        last_log_time = time.monotonic()
+                    except Exception:
+                        pass
 
         stdout_task = asyncio.create_task(_consume_stream(proc.stdout, "stdout"))
         stderr_task = asyncio.create_task(_consume_stream(proc.stderr, "stderr"))
@@ -458,14 +523,15 @@ async def spawn_agent(
                     now = time.monotonic()
                     if now - last_ping >= 2.0:
                         last_ping = now
-                        try:
-                            await ctx.report_progress(
-                                agent_index if agent_index is not None else 1,
-                                agent_count,
-                                f"[{agent_label}] Codex agent running...",
-                            )
-                        except Exception:
-                            pass
+                        if ctx:
+                            try:
+                                await ctx.report_progress(
+                                    agent_index if agent_index is not None else 1,
+                                    agent_count,
+                                    f"[{agent_label}] Codex agent running...",
+                                )
+                            except Exception:
+                                pass
 
         try:
             returncode = await asyncio.wait_for(
@@ -499,11 +565,13 @@ async def spawn_agent(
                     except Exception:
                         pass
 
+            # Log timeout as JSON (important event)
             await _write_log(
                 "error",
                 "timeout",
-                f"Codex agent timed out after {timeout_seconds} seconds",
+                f"Codex agent timed out after {timeout_seconds} seconds (elapsed: {round(time.monotonic() - start_time, 2)}s)",
                 {**base_context, "timeout_seconds": timeout_seconds, "elapsed_seconds": round(time.monotonic() - start_time, 2)},
+                as_json=True,
             )
             raise ToolExecutionError(
                 code="agent_timeout",
@@ -522,12 +590,14 @@ async def spawn_agent(
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
-        # Log completion
+        # Log completion as JSON (important event)
+        elapsed_final = round(time.monotonic() - start_time, 2)
         await _write_log(
             "info",
             "agent_complete",
-            f"Codex agent process completed with exit code: {returncode}",
-            {**base_context, "exit_code": returncode, "elapsed_seconds": round(time.monotonic() - start_time, 2)},
+            f"Codex agent completed with exit code {returncode} (elapsed: {elapsed_final}s)",
+            {**base_context, "exit_code": returncode, "elapsed_seconds": elapsed_final},
+            as_json=True,
         )
 
         # Robustly read output file with retries (Codex might still be flushing)
@@ -538,12 +608,14 @@ async def spawn_agent(
             try:
                 if output_path.exists():
                     file_size = output_path.stat().st_size
-                    await _write_log(
-                        "info",
-                        "output_check",
-                        f"Output file exists, size: {file_size} bytes (attempt {attempt + 1}/{max_retries})",
-                        {**base_context, "attempt": attempt + 1, "file_size": file_size},
-                    )
+                    # Only log on first attempt or if retrying
+                    if attempt == 0 or attempt == max_retries - 1:
+                        await _write_log(
+                            "info",
+                            "output_check",
+                            f"Output file size: {file_size} bytes (attempt {attempt + 1}/{max_retries})",
+                            as_json=False,
+                        )
 
                     # Wait a moment for file system flush
                     if attempt > 0:
@@ -558,6 +630,7 @@ async def spawn_agent(
                             "output_empty_retry",
                             f"Output file empty on attempt {attempt + 1}, retrying...",
                             {**base_context, "attempt": attempt + 1},
+                            as_json=True,  # Important warning
                         )
                     else:
                         await _write_log(
@@ -565,6 +638,7 @@ async def spawn_agent(
                             "output_missing",
                             "Output file is empty after all retries",
                             {**base_context, "attempt": attempt + 1},
+                            as_json=True,  # Important warning
                         )
                 else:
                     await _write_log(
@@ -572,6 +646,7 @@ async def spawn_agent(
                         "output_missing",
                         f"Output file does not exist: {output_path}",
                         {**base_context, "attempt": attempt + 1},
+                        as_json=True,  # Important error
                     )
                     output_error = ToolExecutionError(
                         code="output_missing",
@@ -586,7 +661,8 @@ async def spawn_agent(
                     "error",
                     "output_read_error",
                     f"Failed to read output file (attempt {attempt + 1}): {e}",
-                    {**base_context, "attempt": attempt + 1},
+                    {**base_context, "attempt": attempt + 1, "error": str(e)},
+                    as_json=True,  # Important error
                 )
                 output_error = ToolExecutionError(
                     code="output_read_failed",
@@ -603,12 +679,13 @@ async def spawn_agent(
             await _write_log(
                 "error",
                 "agent_failed",
-                "Codex agent exited with non-zero status",
+                f"Codex agent exited with non-zero status (exit code: {returncode})",
                 {
                     **base_context,
                     "exit_code": returncode,
                     "recent_lines": list(recent_lines)[-5:],
                 },
+                as_json=True,  # Important error
             )
             raise ToolExecutionError(
                 code="agent_non_zero_exit",
@@ -635,6 +712,7 @@ async def spawn_agent(
                 "output_fallback",
                 "Output file empty, using recent lines as fallback",
                 {**base_context, "recent_line_count": len(recent_lines)},
+                as_json=True,  # Important warning
             )
             return "\n".join([
                 "Warning: Codex agent completed but output file was empty.",
@@ -656,6 +734,261 @@ async def spawn_agent(
                 if cleanup_attempt < cleanup_retries - 1:
                     await asyncio.sleep(0.2)
                 # Silently fail on last attempt - file will be cleaned up later
+
+
+@mcp.tool()
+async def spawn_agent(
+    ctx: Context,
+    prompt: str,
+    reasoning_effort: Optional[str] = None,
+    model: Optional[str] = None,
+    agent_index: Optional[int] = None,
+    agent_count: Optional[int] = None,
+) -> str:
+    """Spawn a Codex agent to work inside the configured working directory.
+
+    This is a BLOCKING tool - it waits for the agent to complete before returning.
+
+    ⚠️  IMPORTANT - Claude Desktop Compatibility:
+    - Claude Desktop has a FIXED 60-second timeout that CANNOT be configured
+    - Progress updates do NOT reset this timeout (known limitation)
+    - For tasks longer than 50 seconds, use `spawn_agent_async` instead
+    - Recommended: Use Claude Code CLI for long-running tasks
+
+    For non-blocking execution with Claude Desktop, use `spawn_agent_async`.
+
+    The server resolves the working directory via ``CODEX_AGENT_CWD`` if set,
+    otherwise ``os.getcwd()`` so it inherits whatever environment the MCP
+    process currently has. Use the environment variable when the server runs
+    from one location but you want agents to work in another workspace.
+
+    Args:
+        prompt: All instructions/context the agent needs for the task.
+        reasoning_effort: Reasoning level for the task. Defaults to env var
+            CODEX_REASONING_EFFORT or Codex's default.
+            - "low": Fast, simple tasks (file operations, basic edits)
+            - "medium": Balanced approach (default, most tasks)
+            - "high": Complex analysis (architecture design, debugging)
+            - "xhigh": Very complex (reverse engineering, security analysis)
+        model: Override the Codex model. Defaults to user's config (~/.codex/config.toml).
+            Examples: "o3-mini", "o1-preview", "gpt-5.1-codex-max"
+
+    Returns:
+        The agent's final response (clean output from Codex CLI) with the log
+        file path appended, or a clear timeout/error message.
+    """
+    return await _run_codex_agent(ctx, prompt, reasoning_effort, model, agent_index, agent_count)
+
+
+@mcp.tool()
+async def spawn_agent_async(
+    ctx: Context,
+    prompt: str,
+    reasoning_effort: Optional[str] = None,
+    model: Optional[str] = None,
+) -> dict[str, Any]:
+    """Spawn a Codex agent asynchronously (non-blocking, returns immediately).
+
+    ✅ RECOMMENDED for Claude Desktop - avoids the 60-second timeout limitation.
+
+    This tool starts a Codex agent in the background and returns immediately with
+    a task ID. Use `get_agent_status(task_id)` to check progress and retrieve results.
+
+    Workflow:
+    1. Call spawn_agent_async() → returns task_id and log_file
+    2. Optionally read log_file while running (using Read tool)
+    3. Call get_agent_status(task_id) to check if completed
+    4. When status is "completed", retrieve the output
+
+    The server resolves the working directory via ``CODEX_AGENT_CWD`` if set,
+    otherwise ``os.getcwd()``.
+
+    Args:
+        prompt: All instructions/context the agent needs for the task.
+        reasoning_effort: Reasoning level ("low", "medium", "high", "xhigh")
+        model: Override the Codex model (e.g., "o3-mini", "o1-preview")
+
+    Returns:
+        dict with:
+        - task_id: Unique identifier for this task
+        - status: "running"
+        - log_file: Path to log file (can be read while task is running)
+        - started_at: ISO timestamp when task started
+    """
+    # Basic validation
+    if not isinstance(prompt, str):
+        raise ToolExecutionError(
+            code="invalid_prompt_type",
+            kind=ErrorCategory.VALIDATION,
+            message="'prompt' must be a string.",
+        )
+    if not prompt.strip():
+        raise ToolExecutionError(
+            code="empty_prompt",
+            kind=ErrorCategory.VALIDATION,
+            message="'prompt' is required and cannot be empty.",
+        )
+
+    # Generate unique task ID
+    task_id = f"codex_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+    # Allocate log file paths
+    log_file, output_path = _allocate_log_paths(None)
+
+    # Enhance prompt to prevent agent from waiting for user input
+    enhanced_prompt = f"""{prompt}
+
+IMPORTANT: After completing the task, provide a final summary and terminate immediately.
+Do NOT ask for further instructions or wait for user input."""
+
+    started_at = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    start_time = time.time()
+
+    # Create background task
+    async def _background_runner():
+        try:
+            output = await _run_codex_agent(
+                None,  # No context for background tasks
+                enhanced_prompt,
+                reasoning_effort,
+                model,
+                agent_index=None,
+                agent_count=None,
+            )
+            async with asyncio.Lock():
+                running_tasks[task_id]["status"] = "completed"
+                running_tasks[task_id]["output"] = output
+                running_tasks[task_id]["completed_at"] = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+                running_tasks[task_id]["elapsed_seconds"] = round(time.time() - start_time, 2)
+        except ToolExecutionError as e:
+            async with asyncio.Lock():
+                running_tasks[task_id]["status"] = "failed"
+                running_tasks[task_id]["error"] = e.payload.to_dict()
+                running_tasks[task_id]["completed_at"] = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+                running_tasks[task_id]["elapsed_seconds"] = round(time.time() - start_time, 2)
+        except Exception as e:
+            async with asyncio.Lock():
+                running_tasks[task_id]["status"] = "failed"
+                running_tasks[task_id]["error"] = {
+                    "code": "unexpected_error",
+                    "kind": "runtime_error",
+                    "message": f"Unexpected error: {str(e)}",
+                }
+                running_tasks[task_id]["completed_at"] = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+                running_tasks[task_id]["elapsed_seconds"] = round(time.time() - start_time, 2)
+
+    # Start the background task
+    task = asyncio.create_task(_background_runner())
+
+    # Register task in global tracking
+    running_tasks[task_id] = {
+        "task": task,
+        "status": "running",
+        "output": None,
+        "error": None,
+        "log_file": str(log_file),
+        "started_at": started_at,
+        "completed_at": None,
+        "elapsed_seconds": None,
+    }
+
+    # Return immediately
+    return {
+        "task_id": task_id,
+        "status": "running",
+        "log_file": str(log_file),
+        "started_at": started_at,
+    }
+
+
+@mcp.tool()
+async def get_agent_status(task_id: str) -> dict[str, Any]:
+    """Get the status of an asynchronously spawned agent.
+
+    Use this tool to check if an agent started with `spawn_agent_async` has
+    completed, and to retrieve its results.
+
+    Args:
+        task_id: The task ID returned by spawn_agent_async
+
+    Returns:
+        dict with:
+        - task_id: The task identifier
+        - status: "running", "completed", or "failed"
+        - log_file: Path to log file
+        - started_at: ISO timestamp
+        - completed_at: ISO timestamp (only if completed/failed)
+        - elapsed_seconds: Runtime in seconds (only if completed/failed)
+        - output: Agent's final response (only if status="completed")
+        - error: Error details (only if status="failed")
+    """
+    if task_id not in running_tasks:
+        raise ToolExecutionError(
+            code="task_not_found",
+            kind=ErrorCategory.VALIDATION,
+            message=f"Task ID '{task_id}' not found. Use list_agent_tasks to see available tasks.",
+        )
+
+    info = running_tasks[task_id]
+    result: dict[str, Any] = {
+        "task_id": task_id,
+        "status": info["status"],
+        "log_file": info["log_file"],
+        "started_at": info["started_at"],
+    }
+
+    if info["completed_at"]:
+        result["completed_at"] = info["completed_at"]
+        result["elapsed_seconds"] = info["elapsed_seconds"]
+
+    if info["status"] == "completed" and info["output"]:
+        result["output"] = info["output"]
+
+    if info["status"] == "failed" and info["error"]:
+        result["error"] = info["error"]
+
+    return result
+
+
+@mcp.tool()
+async def list_agent_tasks() -> dict[str, Any]:
+    """List all agent tasks (running and completed).
+
+    Returns:
+        dict with:
+        - total: Total number of tasks
+        - running: Number of running tasks
+        - completed: Number of completed tasks
+        - failed: Number of failed tasks
+        - tasks: List of task summaries with task_id, status, started_at
+    """
+    tasks_summary = []
+    counts = {"running": 0, "completed": 0, "failed": 0}
+
+    for task_id, info in running_tasks.items():
+        status = info["status"]
+        counts[status] = counts.get(status, 0) + 1
+
+        task_info: dict[str, Any] = {
+            "task_id": task_id,
+            "status": status,
+            "started_at": info["started_at"],
+            "log_file": info["log_file"],
+        }
+
+        if info["completed_at"]:
+            task_info["completed_at"] = info["completed_at"]
+            task_info["elapsed_seconds"] = info["elapsed_seconds"]
+
+        tasks_summary.append(task_info)
+
+    return {
+        "total": len(running_tasks),
+        "running": counts["running"],
+        "completed": counts["completed"],
+        "failed": counts["failed"],
+        "tasks": tasks_summary,
+    }
 
 
 @mcp.tool()

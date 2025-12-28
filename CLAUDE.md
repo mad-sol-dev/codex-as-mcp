@@ -56,39 +56,115 @@ twine upload dist/* --username "$PYPI_USERNAME" --password "$PYPI_TOKEN" --non-i
 ### Core Components
 
 - **`src/codex_as_mcp/server.py`**: Main MCP server implementation using FastMCP
-  - Exposes two tools: `spawn_agent` and `spawn_agents_parallel`
+  - Exposes 5 tools: `spawn_agent`, `spawn_agent_async`, `get_agent_status`, `list_agent_tasks`, `spawn_agents_parallel`
   - Manages Codex CLI subprocess execution with stdout/stderr capture
   - Implements log rotation and persistent logging to `~/.cache/codex-as-mcp/logs`
   - Progress reporting via MCP context with heartbeats every 2 seconds
+  - Async task tracking for background agent execution
 
 - **`src/codex_as_mcp/__main__.py`**: Entry point for `python -m codex_as_mcp`
 
 ### MCP Tools
 
-1. **`spawn_agent(prompt: str, reasoning_effort: str | None, model: str | None, agent_index: int | None, agent_count: int | None)`**
-   - Spawns a single Codex agent with `codex e --full-auto`
-   - Runs in server's current working directory (`os.getcwd()`)
-   - Returns agent's final message and log file path
-   - Default timeout: 8 hours (28800 seconds) - configurable via `CODEX_TIMEOUT_SECONDS` env var
-   - **Parameters:**
-     - `prompt`: Instructions for the agent
-     - `reasoning_effort`: Optional. "low", "medium", "high", or "xhigh" (see recommendations below)
-     - `model`: Optional. Override Codex model (e.g., "o3-mini", "o1-preview")
-   - Command: `codex e --cd <work_dir> --skip-git-repo-check --full-auto [--model <model>] [-c model_reasoning_effort=<level>] --output-last-message <temp_file> "<prompt>"`
+#### 1. `spawn_agent` (Blocking) - For Claude Code CLI
 
-2. **`spawn_agents_parallel(agents: list[dict], max_parallel: int | None = None)`**
-   - Spawns multiple Codex agents concurrently using `asyncio.gather`
-   - Optional `max_parallel` caps simultaneous agents via `asyncio.Semaphore` (default `None` = no limit)
-   - Each agent spec is a dict with `prompt` and optional `reasoning_effort`, `model`
-   - Returns list of results with `index`, `output`/`error`, and `log_file` fields
-   - **Example:**
-     ```json
-     [
-       {"prompt": "Create math.md"},
-       {"prompt": "Analyze binary", "reasoning_effort": "high"},
-       {"prompt": "Debug issue", "model": "o3-mini"}
-     ]
-     ```
+**⚠️ NOT recommended for Claude Desktop** (60-second timeout limitation)
+
+```python
+spawn_agent(
+    prompt: str,
+    reasoning_effort: str | None = None,
+    model: str | None = None,
+    agent_index: int | None = None,
+    agent_count: int | None = None
+) -> str
+```
+
+- Spawns a single Codex agent with `codex e --full-auto` (BLOCKING - waits for completion)
+- Runs in server's current working directory (override with `CODEX_AGENT_CWD`)
+- Returns agent's final message and log file path
+- Default timeout: 8 hours (28800 seconds) - configurable via `CODEX_TIMEOUT_SECONDS` env var
+- **Parameters:**
+  - `prompt`: Instructions for the agent
+  - `reasoning_effort`: Optional. "low", "medium", "high", or "xhigh"
+  - `model`: Optional. Override Codex model (e.g., "o3-mini", "o1-preview")
+  - `agent_index`, `agent_count`: For parallel execution tracking
+- Command: `codex e --cd <work_dir> --skip-git-repo-check --full-auto [--model <model>] [-c model_reasoning_effort=<level>] --output-last-message <temp_file> "<prompt>"`
+
+#### 2. `spawn_agent_async` (Non-blocking) - ✅ Recommended for Claude Desktop
+
+```python
+spawn_agent_async(
+    prompt: str,
+    reasoning_effort: str | None = None,
+    model: str | None = None
+) -> dict
+```
+
+- Spawns a Codex agent in the background and returns IMMEDIATELY
+- **Avoids Claude Desktop's 60-second timeout** - tool call returns within milliseconds
+- Returns: `{"task_id": "...", "status": "running", "log_file": "...", "started_at": "..."}`
+- Automatically enhances prompt to prevent agent from waiting for user input
+- Agent continues running in background; use `get_agent_status(task_id)` to check progress
+
+**Workflow:**
+```python
+# 1. Start agent (returns immediately)
+result = spawn_agent_async("Scan repository for sensitive data")
+# Returns: {"task_id": "codex_20251228_123456_abc123", "status": "running", "log_file": "/home/.../.log", ...}
+
+# 2. Check status (can be called multiple times)
+status = get_agent_status(result["task_id"])
+# Returns: {"status": "running|completed|failed", "output": "..." (if completed), ...}
+
+# 3. Optionally read log file while running
+Read(result["log_file"])  # See real-time progress
+```
+
+#### 3. `get_agent_status` - Check async agent status
+
+```python
+get_agent_status(task_id: str) -> dict
+```
+
+- Get status of an agent started with `spawn_agent_async`
+- Returns:
+  - `status`: "running", "completed", or "failed"
+  - `output`: Agent's final response (if completed)
+  - `error`: Error details (if failed)
+  - `log_file`: Path to log file
+  - `elapsed_seconds`: Runtime (if completed/failed)
+
+#### 4. `list_agent_tasks` - List all tracked tasks
+
+```python
+list_agent_tasks() -> dict
+```
+
+- Returns summary of all agent tasks (running and completed)
+- Useful for debugging and monitoring multiple agents
+
+#### 5. `spawn_agents_parallel` - Run multiple agents concurrently
+
+```python
+spawn_agents_parallel(
+    agents: list[dict],
+    max_parallel: int | None = None
+) -> list[dict]
+```
+
+- Spawns multiple Codex agents concurrently using `asyncio.gather`
+- Optional `max_parallel` caps simultaneous agents via `asyncio.Semaphore` (default `None` = no limit)
+- Each agent spec is a dict with `prompt` and optional `reasoning_effort`, `model`
+- Returns list of results with `index`, `output`/`error`, and `log_file` fields
+- **Example:**
+  ```json
+  [
+    {"prompt": "Create math.md"},
+    {"prompt": "Analyze binary", "reasoning_effort": "high"},
+    {"prompt": "Debug issue", "model": "o3-mini"}
+  ]
+  ```
 
 ### Logging System
 
@@ -97,6 +173,31 @@ twine upload dist/* --username "$PYPI_USERNAME" --password "$PYPI_TOKEN" --non-i
 - Filename format: `codex_agent_<timestamp>_<pid>_[agent_index]_<uuid>.log`
 - Temporary output files cleaned up after agent completes
 - Recent 50 lines kept in memory for error reporting
+
+#### Log Format
+
+**Human-Readable Text Format** (default for streaming output):
+```
+[2025-12-15 22:00:00] INFO    stdout: Analyzing codebase...
+[2025-12-15 22:00:15] INFO    stdout: Found 42 files
+[2025-12-15 22:00:30] INFO    progress: [agent] 30s elapsed; stdout=12; stderr=5
+[2025-12-15 22:00:45] INFO    stdout: Creating analysis report
+```
+
+- **stdout/stderr**: Simple text format for real-time monitoring with `tail -f`
+- **Progress updates**: Only logged when output changes OR every 10 seconds (reduces repetitiveness)
+- **Important events**: JSON format for start, completion, errors, and warnings
+
+**JSON Format** (for important events only):
+```json
+{"ts": "2025-12-15T22:00:00.000Z", "level": "info", "event": "agent_start", "message": "Launching Codex agent", "context": {...}}
+{"ts": "2025-12-15T22:00:45.000Z", "level": "error", "event": "timeout", "message": "Codex agent timed out", "context": {...}}
+```
+
+This dual-format approach makes logs:
+- **Readable**: Easy to monitor with `tail -f ~/.cache/codex-as-mcp/logs/codex_agent_*.log`
+- **Compact**: Only logs changes, not repetitive progress updates
+- **Structured**: JSON for machine-readable events when needed
 
 ### Error Handling
 
@@ -182,6 +283,69 @@ Override the default log directory (`~/.cache/codex-as-mcp/logs`).
   }
 }
 ```
+
+## Client Compatibility & Timeouts
+
+### ⚠️ Important: Claude Desktop Limitation
+
+**Claude Desktop has a fixed 60-second timeout** for MCP tool calls that **cannot be configured** and **does not reset on progress updates**. This means:
+
+- ❌ Tasks longer than 60 seconds will fail with `MCP error -32001: Request timed out`
+- ❌ Progress updates do NOT reset the timeout (known limitation)
+- ❌ No configuration workaround available with blocking tools
+
+### ✅ Solution: Use `spawn_agent_async` with Claude Desktop
+
+**For Claude Desktop users, use the async workflow:**
+
+```python
+# 1. Start agent (returns immediately, no timeout)
+result = spawn_agent_async("Long-running task...")
+# Returns in <1 second with task_id
+
+# 2. Poll for status (each call is <1 second)
+status = get_agent_status(result["task_id"])
+# Can call this multiple times until status == "completed"
+
+# 3. Read log file to monitor progress
+Read(result["log_file"])  # See what the agent is doing
+```
+
+**Benefits:**
+- ✅ No 60-second timeout issues (each tool call returns quickly)
+- ✅ Can monitor progress via log file
+- ✅ Can check status as frequently as needed
+- ✅ Agent runs autonomously in background
+
+**For Claude Code CLI users:**
+- ✅ Can use either `spawn_agent` (blocking) or `spawn_agent_async`
+- ✅ Use `./test.sh` for testing (properly configured timeouts)
+- ✅ Use MCP Inspector for development (supports timeout configuration)
+
+### Claude Code CLI (Recommended for Long Tasks)
+
+Claude Code CLI properly supports:
+- ✅ Configurable timeouts via `MCP_TIMEOUT` and `MCP_TOOL_TIMEOUT`
+- ✅ Timeout reset on progress updates (`MCP_REQUEST_TIMEOUT_RESET_ON_PROGRESS=true`)
+- ✅ Long-running tasks up to 8 hours
+
+Configure in `~/.claude/settings.json`:
+```json
+{
+  "env": {
+    "MCP_TIMEOUT": "60000",
+    "MCP_TOOL_TIMEOUT": "28800000",
+    "MCP_REQUEST_TIMEOUT_RESET_ON_PROGRESS": "true"
+  }
+}
+```
+
+### Related Issues
+
+This is a known limitation tracked in:
+- [Issue #470: resetTimeoutOnProgress](https://github.com/anthropics/claude-code/issues/470)
+- [Issue #424: MCP Timeout needs to be configurable](https://github.com/anthropics/claude-code/issues/424)
+- [Issue #5221: Make MCP tool timeouts configurable](https://github.com/anthropics/claude-code/issues/5221)
 
 ## Testing with MCP Inspector
 
