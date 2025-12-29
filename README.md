@@ -1,9 +1,11 @@
 # codex-as-mcp
 
-Minimal MCP server that lets you spawn Codex agents from any MCP client. Seven tools are exposed:
+Minimal MCP server that lets you spawn Codex agents from any MCP client. Nine tools are exposed:
 - `spawn_agent` (blocking) - Runs a single Codex agent and waits for completion
 - `spawn_agent_async` (non-blocking) - Starts an agent in the background, returns immediately
 - `get_agent_status` - Check status of async agents
+- `kill_agent` - Cancel stuck or unwanted agents (SIGTERM/SIGKILL)
+- `list_running_agents` - List all currently running agents with PIDs
 - `list_agent_tasks` - List all running/completed async tasks
 - `spawn_agents_parallel` - Launches multiple Codex agents concurrently
 - `list_agent_logs` - List recent agent log files with size and timestamps
@@ -107,6 +109,10 @@ See [CLAUDE.md](./CLAUDE.md) for detailed documentation.
 
 - **`get_agent_status(task_id)`** – Check the status of an async agent. Returns `"running"`, `"completed"`, or `"failed"` with output/error details.
 
+- **`kill_agent(task_id, force?, timeout?)`** – Cancel a running agent. Use `force=False` for graceful shutdown (SIGTERM → SIGKILL), or `force=True` for immediate kill (SIGKILL). **Only kills the spawned agent, never the MCP server.**
+
+- **`list_running_agents()`** – List all currently running agents with their PIDs, task IDs, and status. Useful for finding stuck agents to kill.
+
 - **`list_agent_tasks()`** – List all tracked agent tasks (running and completed).
 
 ### Parallel Execution
@@ -121,6 +127,12 @@ See [CLAUDE.md](./CLAUDE.md) for detailed documentation.
 ```bash
 tail -f ~/.cache/codex-as-mcp/logs/codex_agent_*.log
 ```
+
+### Process Management
+
+**Automatic cleanup**: Zombie processes are prevented using process groups (Unix) and signal handlers. When Claude Desktop or the MCP server exits, all spawned agents are automatically terminated.
+
+**Stalled detection**: Agents that produce no output for 60+ seconds trigger warning logs showing process state (running/sleeping/disk-wait), helping diagnose whether Codex or a subprocess is stuck.
 
 ## Examples
 
@@ -226,6 +238,27 @@ for result in results:
 | `gpt-5-codex` | macOS/Linux default | Medium | Medium |
 
 **Note:** Models like `o3-mini`, `o1-preview`, or `codex-1` are **NOT** supported in Codex CLI. Always use the `gpt-5.x-codex` variants.
+
+### Handling Stuck Agents
+
+```python
+# Find running agents
+agents = list_running_agents()
+# Returns: {"count": 1, "agents": [{"task_id": "codex_20251229_...", "pid": 12345, "elapsed_seconds": 1800, ...}]}
+
+# Kill a stuck agent (graceful - tries SIGTERM first, escalates to SIGKILL if needed)
+result = kill_agent(agents["agents"][0]["task_id"], force=False)
+# Returns: {"killed": true, "signal_used": "SIGTERM", "message": "Successfully killed agent...", ...}
+
+# Force kill immediately with SIGKILL
+kill_agent(task_id, force=True)
+```
+
+**Stalled agent diagnostics**: Check log files for warnings showing process state:
+```bash
+tail -f ~/.cache/codex-as-mcp/logs/codex_agent_*.log
+# Look for: {"event": "stalled", "message": "No new output for 120s. Process state: sleeping. Last: rg -n ...", ...}
+```
 
 ### Log Management
 

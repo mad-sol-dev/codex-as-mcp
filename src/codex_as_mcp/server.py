@@ -21,6 +21,8 @@ import contextlib
 import json
 import os
 import shutil
+import signal
+import sys
 import time
 import uuid
 from collections import deque
@@ -53,6 +55,11 @@ mcp = FastMCP("codex-subagent")
 
 # Global task tracking for async agent spawning
 running_tasks: dict[str, dict[str, Any]] = {}
+
+# Track all spawned Codex processes for kill_agent tool
+# Key: task_id (for async) or f"sync_{pid}" (for blocking spawn_agent)
+# Value: {"process": Process, "pid": int, "task_id": str|None, "started_at": str, "log_file": str}
+active_agents: dict[str, dict[str, Any]] = {}
 
 
 class ErrorCategory(str, Enum):
@@ -231,6 +238,7 @@ async def _run_codex_agent(
     model: Optional[str] = None,
     agent_index: Optional[int] = None,
     agent_count: Optional[int] = None,
+    task_id: Optional[str] = None,
 ) -> str:
     """Internal function that runs a Codex agent.
 
@@ -244,12 +252,14 @@ async def _run_codex_agent(
         model: Model override (e.g., "gpt-5.2-codex", "gpt-5.1-codex-mini")
         agent_index: Index of this agent (for parallel execution)
         agent_count: Total number of agents (for parallel execution)
+        task_id: Task ID for tracking (used by spawn_agent_async)
 
     Returns:
         The agent's final response with log file path appended
     """
     log_file: Path | None = None
     output_path: Path | None = None
+    agent_key: str | None = None
 
     # Basic validation to avoid confusing UI errors
     if not isinstance(prompt, str):
@@ -387,11 +397,19 @@ async def _run_codex_agent(
             except Exception:
                 pass
 
+        # Define preexec_fn for Unix only - creates new process group
+        def make_process_group():
+            """Create new process group. Runs in child process before exec."""
+            os.setpgid(0, 0)
+
+        preexec = make_process_group if sys.platform != 'win32' else None
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                preexec_fn=preexec,
             )
             # Log process start as JSON (important event)
             await _write_log(
@@ -401,6 +419,16 @@ async def _run_codex_agent(
                 {**base_context, "command": cmd, "pid": proc.pid},
                 as_json=True,
             )
+
+            # Register process in global tracking for kill_agent tool
+            agent_key = task_id if task_id else f"sync_{proc.pid}"
+            active_agents[agent_key] = {
+                "process": proc,
+                "pid": proc.pid,
+                "task_id": task_id,
+                "started_at": datetime.utcnow().isoformat(),
+                "log_file": str(log_file),
+            }
         except Exception as e:
             # Log error as JSON
             await _write_log(
@@ -450,10 +478,12 @@ async def _run_codex_agent(
         last_logged_line = ""
         last_log_time = start_time
         warned_about_desktop_timeout = False
+        last_output_time = start_time  # Track when we last saw output
+        last_stall_warning_time = 0.0  # Track when we last warned about stall
 
         async def _progress_reporter() -> None:
             """Report progress every 2s via MCP, but only log when something changes or every 10s."""
-            nonlocal last_logged_line, last_log_time, warned_about_desktop_timeout
+            nonlocal last_logged_line, last_log_time, warned_about_desktop_timeout, last_output_time, last_stall_warning_time
             while not stop_progress.is_set():
                 await asyncio.sleep(2)
                 elapsed = time.monotonic() - start_time
@@ -493,6 +523,49 @@ async def _run_codex_agent(
                         )
                     except Exception:
                         pass
+
+                # Track last output time for stall detection
+                total_lines = stdout_lines + stderr_lines
+                if total_lines > 0 and last_non_empty_line != last_logged_line:
+                    last_output_time = time.monotonic()
+
+                # Stalled detection - check if no new output for 60+ seconds
+                stalled_duration = time.monotonic() - last_output_time
+                if stalled_duration >= 60:
+                    # Only log warning every 60 seconds to avoid spam
+                    if time.monotonic() - last_stall_warning_time >= 60:
+                        try:
+                            # Check if process still alive
+                            returncode = proc.returncode
+                            if returncode is None:
+                                # Process running - check state via /proc on Linux
+                                state_info = "running"
+                                if sys.platform == 'linux':
+                                    try:
+                                        with open(f"/proc/{proc.pid}/stat", "r") as f:
+                                            stat = f.read().split()
+                                            # stat[2] is process state: R=running, S=sleeping, D=disk sleep, Z=zombie
+                                            state_code = stat[2]
+                                            state_map = {"R": "running", "S": "sleeping", "D": "disk-wait", "Z": "zombie", "T": "stopped"}
+                                            state_info = state_map.get(state_code, state_code)
+                                    except Exception:
+                                        pass
+
+                                await _write_log(
+                                    "warning",
+                                    "stalled",
+                                    f"No new output for {int(stalled_duration)}s. Process state: {state_info}. Last: {last_non_empty_line[:100]}",
+                                    {
+                                        **base_context,
+                                        "stalled_seconds": int(stalled_duration),
+                                        "process_state": state_info,
+                                        "pid": proc.pid,
+                                    },
+                                    as_json=True,
+                                )
+                                last_stall_warning_time = time.monotonic()
+                        except Exception:
+                            pass
 
                 # Only write to log if:
                 # 1. last_non_empty_line changed, OR
@@ -745,11 +818,15 @@ async def _run_codex_agent(
         else:
             return f"Warning: Codex agent completed but produced no output.\n{log_note}"
     finally:
+        # Remove from active tracking
+        if agent_key and agent_key in active_agents:
+            del active_agents[agent_key]
+
         # Ensure cleanup happens even on exceptions
         cleanup_retries = 3
         for cleanup_attempt in range(cleanup_retries):
             try:
-                if output_path.exists():
+                if output_path and output_path.exists():
                     output_path.unlink()
                     break
             except Exception as cleanup_error:
@@ -876,6 +953,7 @@ Do NOT ask for further instructions or wait for user input."""
                 model,
                 agent_index=None,
                 agent_count=None,
+                task_id=task_id,
             )
             async with asyncio.Lock():
                 running_tasks[task_id]["status"] = "completed"
@@ -990,6 +1068,170 @@ async def get_agent_status(task_id: str) -> dict[str, Any]:
         result["error"] = info["error"]
 
     return result
+
+
+@mcp.tool()
+async def kill_agent(
+    task_id: str,
+    force: bool = False,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Kill a running Codex agent (async or blocking).
+
+    IMPORTANT: This kills the spawned Codex agent process ONLY, not the MCP server.
+
+    Args:
+        task_id: Task ID from spawn_agent_async, or use list_running_agents to find running agents
+        force: If False, try SIGTERM (graceful). If True, use SIGKILL (immediate).
+        timeout: Seconds to wait for graceful shutdown before giving up (default: 5.0)
+
+    Returns:
+        dict with:
+        - task_id: The task identifier
+        - killed: True if process was terminated
+        - signal_used: "SIGTERM", "SIGKILL", or "SIGTERM->SIGKILL"
+        - message: Human-readable result
+    """
+    if task_id not in active_agents:
+        # Check if it's in running_tasks but already completed
+        if task_id in running_tasks:
+            status = running_tasks[task_id]["status"]
+            return {
+                "task_id": task_id,
+                "killed": False,
+                "message": f"Agent already {status}, no process to kill",
+            }
+        raise ToolExecutionError(
+            code="agent_not_found",
+            kind=ErrorCategory.VALIDATION,
+            message=f"No active agent with task_id '{task_id}'. Use list_running_agents to see running agents.",
+        )
+
+    agent_info = active_agents[task_id]
+    proc = agent_info["process"]
+    pid = proc.pid
+    log_file = agent_info["log_file"]
+
+    signal_used = None
+    killed = False
+
+    try:
+        # Check if process is still alive
+        if proc.returncode is not None:
+            return {
+                "task_id": task_id,
+                "killed": False,
+                "message": f"Process (PID {pid}) already exited with code {proc.returncode}",
+            }
+
+        if force:
+            # Immediate SIGKILL
+            proc.kill()
+            signal_used = "SIGKILL"
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=timeout)
+                killed = True
+            except asyncio.TimeoutError:
+                return {
+                    "task_id": task_id,
+                    "killed": False,
+                    "signal_used": signal_used,
+                    "message": f"SIGKILL sent but process (PID {pid}) still alive after {timeout}s",
+                    "log_file": log_file,
+                }
+        else:
+            # Graceful SIGTERM first
+            proc.terminate()
+            signal_used = "SIGTERM"
+
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=timeout)
+                killed = True
+            except asyncio.TimeoutError:
+                # Escalate to SIGKILL
+                proc.kill()
+                signal_used = "SIGTERM->SIGKILL"
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    killed = True
+                except asyncio.TimeoutError:
+                    return {
+                        "task_id": task_id,
+                        "killed": False,
+                        "signal_used": signal_used,
+                        "message": f"Both SIGTERM and SIGKILL failed, process (PID {pid}) may be unkillable",
+                        "log_file": log_file,
+                    }
+
+        # Update task status if it was async
+        if task_id in running_tasks:
+            async with asyncio.Lock():
+                running_tasks[task_id]["status"] = "killed"
+                running_tasks[task_id]["completed_at"] = datetime.utcnow().isoformat()
+                running_tasks[task_id]["error"] = {
+                    "code": "killed_by_user",
+                    "kind": "runtime_error",
+                    "message": f"Agent killed by user with {signal_used}",
+                }
+
+        # Remove from active tracking
+        if task_id in active_agents:
+            del active_agents[task_id]
+
+        return {
+            "task_id": task_id,
+            "killed": True,
+            "pid": pid,
+            "signal_used": signal_used,
+            "message": f"Successfully killed agent (PID {pid}) with {signal_used}",
+            "log_file": log_file,
+        }
+
+    except Exception as e:
+        raise ToolExecutionError(
+            code="kill_failed",
+            kind=ErrorCategory.RUNTIME,
+            message=f"Failed to kill agent: {str(e)}",
+            log_file=log_file,
+            details={"pid": pid, "error": str(e)},
+        )
+
+
+@mcp.tool()
+async def list_running_agents() -> dict[str, Any]:
+    """List all currently running Codex agents with their PIDs and status.
+
+    Useful for finding the task_id of a stuck agent to kill.
+
+    Returns:
+        dict with:
+        - count: Number of running agents
+        - agents: List of agent info (task_id, pid, elapsed_seconds, log_file)
+    """
+    agents_info = []
+
+    for task_id, agent in active_agents.items():
+        proc = agent["process"]
+        started_at_str = agent["started_at"]
+        try:
+            started_at = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+            elapsed = (datetime.now(started_at.tzinfo) - started_at).total_seconds()
+        except Exception:
+            elapsed = 0.0
+
+        agents_info.append({
+            "task_id": task_id,
+            "pid": agent["pid"],
+            "status": "running" if proc.returncode is None else f"exited:{proc.returncode}",
+            "started_at": started_at_str,
+            "elapsed_seconds": round(elapsed, 1),
+            "log_file": agent["log_file"],
+        })
+
+    return {
+        "count": len(agents_info),
+        "agents": agents_info,
+    }
 
 
 @mcp.tool()
@@ -1283,6 +1525,32 @@ async def cleanup_old_logs(days: int = 7, dry_run: bool = True) -> dict[str, Any
 
 def main() -> None:
     """Entry point for the MCP server v2."""
+
+    # Register signal handlers for graceful shutdown
+    def cleanup_on_shutdown(signum, frame):
+        """Kill all spawned Codex agents when MCP server exits."""
+        if active_agents:
+            sys.stderr.write(f"\n[codex-as-mcp] Shutdown signal {signum}, cleaning up {len(active_agents)} agent(s)...\n")
+            sys.stderr.flush()
+            for task_id, agent in list(active_agents.items()):
+                proc = agent["process"]
+                pid = agent.get("pid")
+                try:
+                    if proc.returncode is None:  # Still running
+                        proc.terminate()
+                        sys.stderr.write(f"[codex-as-mcp] Sent SIGTERM to agent PID {pid}\n")
+                        sys.stderr.flush()
+                except Exception as e:
+                    sys.stderr.write(f"[codex-as-mcp] Failed to kill PID {pid}: {e}\n")
+                    sys.stderr.flush()
+            sys.stderr.write("[codex-as-mcp] Cleanup complete\n")
+            sys.stderr.flush()
+        sys.exit(0)
+
+    # Register for SIGTERM (systemd, docker stop) and SIGINT (Ctrl+C)
+    signal.signal(signal.SIGTERM, cleanup_on_shutdown)
+    signal.signal(signal.SIGINT, cleanup_on_shutdown)
+
     mcp.run()
 
 

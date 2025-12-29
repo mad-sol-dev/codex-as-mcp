@@ -56,11 +56,12 @@ twine upload dist/* --username "$PYPI_USERNAME" --password "$PYPI_TOKEN" --non-i
 ### Core Components
 
 - **`src/codex_as_mcp/server.py`**: Main MCP server implementation using FastMCP
-  - Exposes 7 tools: `spawn_agent`, `spawn_agent_async`, `get_agent_status`, `list_agent_tasks`, `spawn_agents_parallel`, `list_agent_logs`, `cleanup_old_logs`
+  - Exposes 9 tools: `spawn_agent`, `spawn_agent_async`, `get_agent_status`, `kill_agent`, `list_running_agents`, `list_agent_tasks`, `spawn_agents_parallel`, `list_agent_logs`, `cleanup_old_logs`
   - Manages Codex CLI subprocess execution with stdout/stderr capture
   - Implements log rotation and persistent logging to `~/.cache/codex-as-mcp/logs`
   - Progress reporting via MCP context with heartbeats every 2 seconds
   - Async task tracking for background agent execution
+  - **Process management**: Process groups for automatic cleanup, stalled agent detection, cancellation support
   - **Output size protection**: Automatically truncates responses >4000 chars to prevent Claude Desktop sync issues
 
 - **`src/codex_as_mcp/__main__.py`**: Entry point for `python -m codex_as_mcp`
@@ -136,7 +137,65 @@ get_agent_status(task_id: str) -> dict
   - `log_file`: Path to log file
   - `elapsed_seconds`: Runtime (if completed/failed)
 
-#### 4. `list_agent_tasks` - List all tracked tasks
+#### 4. `kill_agent` - Cancel a running agent
+
+```python
+kill_agent(
+    task_id: str,
+    force: bool = False,
+    timeout: float = 5.0
+) -> dict
+```
+
+- Kill a stuck or unwanted Codex agent (async or blocking)
+- **IMPORTANT**: Only kills the spawned agent process, NOT the MCP server
+- **Parameters:**
+  - `task_id`: Task ID from `spawn_agent_async` or `list_running_agents`
+  - `force`: If False, use SIGTERM (graceful). If True, use SIGKILL (immediate)
+  - `timeout`: Seconds to wait for graceful shutdown before escalating (default: 5.0)
+- **Behavior:**
+  - `force=False`: Try SIGTERM, wait `timeout` seconds, escalate to SIGKILL if needed
+  - `force=True`: Immediately send SIGKILL
+- **Returns:**
+  - `killed`: True if process was terminated
+  - `signal_used`: "SIGTERM", "SIGKILL", or "SIGTERM->SIGKILL"
+  - `message`: Human-readable result
+  - `log_file`: Path to agent's log file
+- **Use case**: Stop agents that are stuck, in infinite loops, or no longer needed
+
+**Example workflow:**
+```python
+# Find stuck agent
+agents = list_running_agents()
+# Kill it gracefully
+kill_agent(agents["agents"][0]["task_id"], force=False)
+```
+
+#### 5. `list_running_agents` - List currently running agents
+
+```python
+list_running_agents() -> dict
+```
+
+- List all currently running Codex agents with PIDs and status
+- Useful for finding the `task_id` of a stuck agent to kill
+- **Returns:**
+  - `count`: Number of running agents
+  - `agents`: List of agent info with:
+    - `task_id`: Identifier for use with `kill_agent`
+    - `pid`: Process ID
+    - `status`: "running" or "exited:N"
+    - `started_at`: ISO timestamp when started
+    - `elapsed_seconds`: Time since start
+    - `log_file`: Path to log file
+
+**Example:**
+```python
+result = list_running_agents()
+# Returns: {"count": 2, "agents": [{"task_id": "codex_20251229_...", "pid": 12345, ...}, ...]}
+```
+
+#### 6. `list_agent_tasks` - List all tracked tasks
 
 ```python
 list_agent_tasks() -> dict
@@ -145,7 +204,7 @@ list_agent_tasks() -> dict
 - Returns summary of all agent tasks (running and completed)
 - Useful for debugging and monitoring multiple agents
 
-#### 5. `spawn_agents_parallel` - Run multiple agents concurrently
+#### 7. `spawn_agents_parallel` - Run multiple agents concurrently
 
 ```python
 spawn_agents_parallel(
@@ -167,7 +226,7 @@ spawn_agents_parallel(
   ]
   ```
 
-#### 6. `list_agent_logs` - List recent log files
+#### 8. `list_agent_logs` - List recent log files
 
 ```python
 list_agent_logs(max_count: int = 20) -> dict
@@ -182,7 +241,7 @@ list_agent_logs(max_count: int = 20) -> dict
   - `log_dir`: Path to log directory
   - `logs`: List of log file info (path, size_bytes, size_human, modified)
 
-#### 7. `cleanup_old_logs` - Delete old log files
+#### 9. `cleanup_old_logs` - Delete old log files
 
 ```python
 cleanup_old_logs(days: int = 7, dry_run: bool = True) -> dict
@@ -233,6 +292,68 @@ This dual-format approach makes logs:
 - **Readable**: Easy to monitor with `tail -f ~/.cache/codex-as-mcp/logs/codex_agent_*.log`
 - **Compact**: Only logs changes, not repetitive progress updates
 - **Structured**: JSON for machine-readable events when needed
+
+### Process Management & Diagnostics
+
+**Features for managing stuck or runaway agents:**
+
+#### Stalled Agent Detection
+
+- Automatically detects when agents stop producing output for 60+ seconds
+- Logs warning messages every 60 seconds while stalled
+- On Linux: Reads `/proc/{pid}/stat` to show process state:
+  - `running` - Process is executing
+  - `sleeping` - Waiting for I/O or event
+  - `disk-wait` - Blocked on disk I/O (often indicates stuck subprocess)
+  - `zombie` - Process finished but not reaped
+  - `stopped` - Process stopped (e.g., by SIGSTOP)
+- **Log example:**
+  ```json
+  {"ts": "2025-12-29T01:15:30.000Z", "level": "warning", "event": "stalled", "message": "No new output for 120s. Process state: sleeping. Last: rg -n '2025-' 'USB Device Connection'", "context": {"stalled_seconds": 120, "process_state": "sleeping", "pid": 12345, ...}}
+  ```
+- **Use case**: Helps diagnose whether Codex itself is stuck or a subprocess is hanging
+
+#### Process Groups (Automatic Cleanup)
+
+- On Unix systems: Uses `setpgid(0, 0)` to create new process group for each Codex agent
+- **Benefit**: When MCP server exits, kernel sends SIGHUP to entire process group
+- **Result**: No orphaned zombie processes when Claude Desktop or MCP server crashes
+- **Platform**: Linux, macOS, BSD (not available on Windows)
+- **Fallback**: Signal handlers provide backup cleanup mechanism
+
+#### Signal Handlers
+
+- Registers SIGTERM and SIGINT handlers in `main()`
+- On shutdown, sends SIGTERM to all tracked agent processes
+- Cleanup messages written to stderr (safe, doesn't interfere with MCP stdio)
+- **Example stderr output:**
+  ```
+  [codex-as-mcp] Shutdown signal 15, cleaning up 2 agent(s)...
+  [codex-as-mcp] Sent SIGTERM to agent PID 12345
+  [codex-as-mcp] Sent SIGTERM to agent PID 12346
+  [codex-as-mcp] Cleanup complete
+  ```
+
+#### Agent Cancellation
+
+- Use `list_running_agents()` to find stuck agents
+- Use `kill_agent(task_id, force=False)` to terminate gracefully (SIGTERM → SIGKILL)
+- Use `kill_agent(task_id, force=True)` for immediate termination (SIGKILL)
+- **Important**: Only kills spawned Codex agent, never the MCP server itself
+
+**Workflow for stuck agents:**
+```python
+# 1. List running agents
+agents = list_running_agents()
+# Example: {"count": 1, "agents": [{"task_id": "codex_20251229_...", "pid": 12345, "elapsed_seconds": 1800, ...}]}
+
+# 2. Kill the stuck agent (graceful)
+result = kill_agent(agents["agents"][0]["task_id"], force=False)
+# Example: {"killed": true, "signal_used": "SIGTERM", "message": "Successfully killed agent (PID 12345) with SIGTERM", ...}
+
+# 3. If still stuck, force kill
+kill_agent(task_id, force=True)
+```
 
 ### Output Size Protection
 
